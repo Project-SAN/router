@@ -1,3 +1,5 @@
+use clap::Parser;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 
@@ -7,11 +9,11 @@ struct Args {
 }
 
 fn run_chapter1() {
-    Println!("Running chapter 1");
+    println!("Running chapter 1");
 }
 
 fn run_chapter2(mode: &str) {
-    Println!("Running chapter 2 with mode: {}", mode);
+    println!("Running chapter 2 with mode: {}", mode);
 }
 
 fn main() {
