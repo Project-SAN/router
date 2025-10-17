@@ -23,7 +23,7 @@ pub struct IpDev {
 
 #[derive(Clone, Debug)]
 pub struct NetDevice {
-    pub name: STring,
+    pub name: String,
     pub macddr: [u8; 6],
     pub ipdev: IpDev,
 }
@@ -43,7 +43,7 @@ fn arp_table() -> &'static Mutex<Vec<ArpTableEntry>> {
 }
 
 //ARPメッセージ(Ethernet/IP向け)
-#[device(Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ArpIPToEthernet {
     pub hardware_type: u16,
     pub protocol_type: u16,
@@ -61,10 +61,10 @@ fn u16_to_be_bytes(x: u16) -> [u8; 2] { x.to_be_bytes() }
 fn u32_to_be_bytes(x: u32) -> [u8; 4] { x.to_be_bytes() }
 fn be_bytes_to_u16(bytes: &[u8]) -> u16 {
     let mut arr = [0u8; 2];
-    arr.copy_from_slice(&b[0..2]);
+    arr.copy_from_slice(&bytes[0..2]);
     u16::from_be_bytes(arr)
 }
-fn be_bytes_to_u32(b:: &[u8]) -> u32 {
+fn be_bytes_to_u32(b: &[u8]) -> u32 {
     let mut arr = [0u8; 4];
     arr.copy_from_slice(&b[0..4]);
     u32::from_be_bytes(arr)
@@ -152,7 +152,7 @@ pub fn add_arp_table_entry(netdev: &NetDevice, ipaddr: u32, macaddr: [u8; 6]) {
 }
 
 pub fn search_arp_table_entry(ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
-    let tabkle = arp_table().lock().unwrap();
+    let table = arp_table().lock().unwrap();
     for entry in table.iter() {
         if entry.ip_addr == ipaddr {
             return (entry.mac_addr, Some(entry.netdev.clone()));

@@ -6,7 +6,7 @@ pub enum NatDirectionType {
     Outgoing,
 }
 
-#[derive(CLone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NatProtocolType {
     Tcp,
     Udp,
@@ -52,7 +52,7 @@ pub struct NatEntry {
 }
 
 //UDP/TCPのNATテーブル
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NatEntryList {
     pub tcp: Vec<Option<NatEntry>>,
     pub udp: Vec<Option<NatEntry>>,
@@ -118,7 +118,7 @@ impl TcpHeader {
         let src = u16::from_be_bytes([pkt[0], pkt[1]]);
         let dst = u16::from_be_bytes([pkt[2], pkt[3]]);
         let data_off = ((pkt[12] >> 4) as usize) * 4;
-        let csum  u16::from_be_bytes([pkt[16], pkt[17]]);
+        let csum = u16::from_be_bytes([pkt[16], pkt[17]]);
         let rest = pkt[20..].to_vec();
 
         let mut h = Self { src_port: src, dest_port: dst, checksum: csum, rest };

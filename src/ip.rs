@@ -61,12 +61,12 @@ fn ethernet_output(_dev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], _ethert
 }
 
 //NATまわり
-#[device(Clone, Copy)]
+#[derive(Clone, Copy)]
 enum NatProto {
     Udp,
     Tcp,
 }
-#[device(Clone, Copy)]
+#[derive(Clone, Copy)]
 enum NatDir {
     Outgoing,
     Incoming,
@@ -86,13 +86,19 @@ fn nat_exec(
 }
 
 //ルーティング
-#[device(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpRouteType {
     Connected,
     Network,
 }
 
-#[device(Clone, Debug, Default, PartialEq, Eq)]
+impl Default for IpRouteType {
+    fn default() -> Self {
+        IpRouteType::Network
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IpRouteEntry {
     pub iptype: IpRouteType,
     pub netdev: NetDevice,
@@ -100,7 +106,7 @@ pub struct IpRouteEntry {
 }
 
 //簡易ルート表
-#[device(Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RouteTable;
 impl RouteTable {
     pub fn radix_tree_search(&self, _dest: u32) -> IpRouteEntry {
@@ -113,7 +119,7 @@ fn iproute() -> &'static RouteTable {
 }
 
 //IPヘッダとユーティリティ
-#[device(CLone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IpHeader {
     pub version: u8,
     pub header_len: u8,
@@ -188,7 +194,7 @@ pub fn subnet_to_prefix_len(netmask: u32) -> u32 {
 
 pub fn get_ip_device(cidrs: &[&str]) -> IpDevice {
     let mut ipdev = IpDevice::default();
-    for cidr in cides {
+    for cidr in cidrs {
         if let Some((ip_s, pfx_s)) = cidr.split_once('/') {
             if let Ok(ip) = ip_s.parse::<Ipv4Addr>() {
                 if let Ok(pfx) = pfx_s.parse::<u8>() {
@@ -333,7 +339,7 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
             println!(
                 "forward packet is {:x?} : {:x?}",
                 &forward_packet[0..20],
-                net_packet
+                nat_packet
             );
             ip_packet_output_to_nexthop(route.nexthop, &forward_packet);
         }
@@ -345,22 +351,22 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
     for dev in net_device_list().lock().unwrap().iter() {
         if dev.ipdev != IpDevice::default()
             && dev.ipdev.natdev != NatDevice::default()
-            && dev.ipdev,natdev.outside_ip_addr == ipheader.dest_addr
+            && dev.ipdev.natdev.outside_ip_addr == ipheader.dest_addr
         {
-            let mut nat_exected = falst;
+            let mut nat_exected = false;
             let mut dest_packet = Vec::new();
             let res = match ipheader.protocol {
                 IP_PROTOCOL_NUM_UDP => nat_exec (
                     ipheader,
                     NatPacketHeader { packet: payload },
-                    dev.ipdev.natdev.clone(),
+                    &dev.ipdev.natdev.clone(),
                     NatProto::Udp,
                     NatDir::Incoming,
                 ),
                 IP_PROTOCOL_NUM_TCP => nat_exec (
                     ipheader,
                     NatPacketHeader { packet: payload },
-                    dev.ipdev.natdev.clone(),
+                    &dev.ipdev.natdev.clone(),
                     NatProto::Tcp,
                     NatDir::Incoming,
                 ),
@@ -372,7 +378,7 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
                     dest_packet = p;
                 }
             } else {
-                return,
+                return
             }
 
             if nat_exected {
@@ -432,7 +438,7 @@ fn ip_packet_output_to_nexthop(next_hop: u32, packet: &[u8]) {
         let route_to_nexthop = iproute().radix_tree_search(next_hop);
         if route_to_nexthop == IpRouteEntry::default() || route_to_nexthop.iptype != IpRouteType::Connected 
         {
-            println!("Next hop {} is not reachable", print_ip_addr(next?hop));
+            println!("Next hop {} is not reachable", print_ip_addr(next_hop));
         } else {
             send_arp_request(&route_to_nexthop.netdev, next_hop);
         }

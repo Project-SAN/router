@@ -23,34 +23,34 @@ fn ip_packet_encapsulate_output(
 }
 
 //型定義
-#[device(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct IcmpHeader {
     pub icmp_type: u8,
     pub icmp_code: u8,
     pub checksum: u16,
 }
 
-#[device(Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct IcmpEcho {
     pub identify: u16,
     pub sequence: u16,
-    pub timestamp: [u8; 8,],
+    pub timestamp: [u8; 8],
     pub data: Vec<u8>,
 }
 
-#[device(Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct IcmpDestinationUnreachable {
     pub unused: u32,
     pub data: Vec<u8>,
 }
 
-#[device(Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct IcmpTimeExceeded {
     pub unused: u32,
     pub data: Vec<u8>,
 }
 
-#[device(Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct IcmpMessage {
     pub icmp_header: IcmpHeader,
     pub icmp_echo: Option<IcmpEcho>,
@@ -81,7 +81,7 @@ fn calc_checksum(buf: &[u8]) -> [u8; 2] {
         i += 2;
     }
     if i < buf.len() {
-        sum += (bug[i] as u32) << 8;
+        sum += (buf[i] as u32) << 8;
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -142,7 +142,7 @@ impl IcmpMessage {
                 let identify = u16_be(&icmp_packet[4..6]);
                 let sequence = u16_be(&icmp_packet[6..8]);
                 let mut timestamp = [0u8; 8];
-                ts.copy_from_slice(&icmp_packet[8..16]);
+                timestamp.copy_from_slice(&icmp_packet[8..16]);
                 let data = icmp_packet[16..].to_vec();
 
                 Some(IcmpMessage {
