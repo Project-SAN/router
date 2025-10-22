@@ -168,7 +168,7 @@ impl NatEntryList {
         }
     }
 
-    pub fn crate_nat_entry(&mut self, proto: NatProtocolType) -> Option<&mut NatEntry> {
+    pub fn create_nat_entry(&mut self, proto: NatProtocolType) -> Option<&mut NatEntry> {
         match proto {
             NatProtocolType::Udp => {
                 for (i, slot) in self.udp.iter_mut().enumerate() {
@@ -178,7 +178,7 @@ impl NatEntryList {
                     }
                 }
             }
-            atProtocolType::Tcp => {
+            NatProtocolType::Tcp => {
                 for (i, slot) in self.tcp.iter_mut().enumerate() {
                     if slot.is_none() {
                         *slot = Some(NatEntry { global_port: NAT_GLOBAL_PORT_MIN + i as u16, ..Default::default() });
@@ -261,8 +261,10 @@ pub fn nat_exec(
     }
 
     // UDP/TCP をパース
-    let (mut udpheader, mut tcpheader);
-    let (mut src_port, mut dest_port);
+    let mut udpheader = UdpHeader::default();
+    let mut tcpheader = TcpHeader::default();
+    let mut src_port = 0;
+    let mut dest_port = 0;
     match proto {
         NatProtocolType::Udp => {
             udpheader = UdpHeader::parse_packet(nat_packet.packet);
