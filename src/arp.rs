@@ -57,8 +57,12 @@ pub struct ArpIPToEthernet {
 }
 
 //バイト変換ヘルパ
-fn u16_to_be_bytes(x: u16) -> [u8; 2] { x.to_be_bytes() }
-fn u32_to_be_bytes(x: u32) -> [u8; 4] { x.to_be_bytes() }
+fn u16_to_be_bytes(x: u16) -> [u8; 2] {
+    x.to_be_bytes()
+}
+fn u32_to_be_bytes(x: u32) -> [u8; 4] {
+    x.to_be_bytes()
+}
 fn be_bytes_to_u16(bytes: &[u8]) -> u16 {
     let mut arr = [0u8; 2];
     arr.copy_from_slice(&bytes[0..2]);
@@ -84,7 +88,7 @@ fn print_ip_addr(ip: u32) -> String {
 
 fn print_mac_addr(mac: [u8; 6]) -> String {
     let mut s = String::new();
-    for(i, b) in mac.iter().enumerate() {
+    for (i, b) in mac.iter().enumerate() {
         let _ = write!(&mut s, "{:02x}{}", b, if i < 5 { ":" } else { "" });
     }
     s
@@ -192,12 +196,12 @@ pub fn arp_input(netdev: &NetDevice, packet: &[u8]) {
                 arp_reply_arrives(netdev, &arp_msg);
             }
         }
-        _ => {/*他のプロトコルは無視*/}
+        _ => { /*他のプロトコルは無視*/ }
     }
 }
 
 //ARPリクエスト/リプライ処理
-pub fn arp_request_arrives(netdev: &NetDevice, arp: &ArpIPToEthernet){
+pub fn arp_request_arrives(netdev: &NetDevice, arp: &ArpIPToEthernet) {
     if netdev.ipdev.address != 0 && netdev.ipdev.address == arp.target_ip_addr {
         println!(
             "Sendeing arp reply to {}",
@@ -251,15 +255,8 @@ pub fn send_arp_request(netdev: &NetDevice, target_ip: u32) {
     }
     .to_packet();
 
-    ethernet_output(
-        netdev,
-        ETHERNET_ADDRESS_BROADCAST,
-        &req,
-        ETHER_TYPE_ARP,
-    );
+    ethernet_output(netdev, ETHERNET_ADDRESS_BROADCAST, &req, ETHER_TYPE_ARP);
 }
 
 //送信
-fn ethernet_output(_netdev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], ethertype: u16) {
-    
-}
+fn ethernet_output(_netdev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], ethertype: u16) {}

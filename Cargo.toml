@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.95"
 clap = { version = "4.5.47", features = ["derive"] }
+hex = "0.4.3"
+hornet = { git = "https://github.com/Project-SAN/HORNET", features = ["policy-client", "policy-plonk"] }
+libc = "0.2.164"

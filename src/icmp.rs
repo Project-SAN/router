@@ -18,7 +18,7 @@ fn ip_packet_encapsulate_output(
     _dst: u32,
     _payload: &[u8],
     _protocol: u8,
-){
+) {
     //ここでIPヘッダをつけて送信
 }
 
@@ -73,10 +73,10 @@ fn u32_be(b: &[u8]) -> u32 {
 //Internet Checksum (RFC 1071)
 fn calc_checksum(buf: &[u8]) -> [u8; 2] {
     let mut sum: u32 = 0;
-    
+
     let mut i = 0;
     while i + 1 < buf.len() {
-        let word = ((buf[i] as u16) << 8) | (buf[i +1] as u16);
+        let word = ((buf[i] as u16) << 8) | (buf[i + 1] as u16);
         sum += word as u32;
         i += 2;
     }
@@ -100,17 +100,17 @@ fn print_bytes_hex(data: &[u8]) -> String {
 
 impl IcmpMessage {
     pub fn reply_packet(&self) -> Vec<u8> {
-        let echo = match & self.icmp_echo {
+        let echo = match &self.icmp_echo {
             Some(e) => e,
             None => return Vec::new(),
         };
 
-        let mut b =Vec::with_capacity(8 + 8 + echo.data.len());
+        let mut b = Vec::with_capacity(8 + 8 + echo.data.len());
         //ICMPヘッダ
         b.push(ICMP_TYPE_ECHO_REPLY); //type
         b.push(0x00); //code
         b.extend_from_slice(&[0x00, 0x00]); //checksum(後で計算)
-        //ICMP Echo
+                                            //ICMP Echo
         b.extend_from_slice(&echo.identify.to_be_bytes());
         b.extend_from_slice(&echo.sequence.to_be_bytes());
         b.extend_from_slice(&echo.timestamp);
@@ -167,10 +167,7 @@ impl IcmpMessage {
                 Some(IcmpMessage {
                     icmp_header: hdr,
                     icmp_echo: None,
-                    icmp_destination_unreachable: Some(IcmpDestinationUnreachable {
-                        unused,
-                        data,
-                    }),
+                    icmp_destination_unreachable: Some(IcmpDestinationUnreachable { unused, data }),
                     icmp_time_exceeded: None,
                 })
             }
@@ -185,26 +182,21 @@ impl IcmpMessage {
                     icmp_header: hdr,
                     icmp_echo: None,
                     icmp_destination_unreachable: None,
-                    icmp_time_exceeded: Some(IcmpTimeExceeded {
-                        unused,
-                        data,
-                    }),
+                    icmp_time_exceeded: Some(IcmpTimeExceeded { unused, data }),
                 })
             }
-            _ => {
-                Some(IcmpMessage {
-                    icmp_header: hdr,
-                    icmp_echo: None,
-                    icmp_destination_unreachable: None,
-                    icmp_time_exceeded: None,
-                })
-            }
+            _ => Some(IcmpMessage {
+                icmp_header: hdr,
+                icmp_echo: None,
+                icmp_destination_unreachable: None,
+                icmp_time_exceeded: None,
+            }),
         }
     }
 }
 
 //ICMP受信処理
-pub fn icmp_input(inputdev: &NetDevice, source_addr: u32, dest_addr: u32, icmp_packet: &[u8]){
+pub fn icmp_input(inputdev: &NetDevice, source_addr: u32, dest_addr: u32, icmp_packet: &[u8]) {
     if icmp_packet.len() < 4 {
         eprintln!("Received ICMP Packet is too short");
         return;

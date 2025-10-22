@@ -90,7 +90,12 @@ impl UdpHeader {
         let dst = u16::from_be_bytes([pkt[2], pkt[3]]);
         let csum = u16::from_be_bytes([pkt[6], pkt[7]]);
         let payload = pkt[8..].to_vec();
-        Self { src_port: src, dest_port: dst, checksum: csum, payload }
+        Self {
+            src_port: src,
+            dest_port: dst,
+            checksum: csum,
+            payload,
+        }
     }
     fn to_packet(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(8 + self.payload.len());
@@ -121,7 +126,12 @@ impl TcpHeader {
         let csum = u16::from_be_bytes([pkt[16], pkt[17]]);
         let rest = pkt[20..].to_vec();
 
-        let mut h = Self { src_port: src, dest_port: dst, checksum: csum, rest };
+        let mut h = Self {
+            src_port: src,
+            dest_port: dst,
+            checksum: csum,
+            rest,
+        };
         if data_off > 20 && data_off <= pkt.len() {
             h.rest = pkt[data_off..].to_vec();
         }
@@ -152,18 +162,48 @@ fn hex(data: &[u8]) -> String {
 }
 
 impl NatEntryList {
-    pub fn get_nat_entry_by_global(&self, proto: NatProtocolType, ipaddr: u32, port: u16) -> Option<NatEntry> {
+    pub fn get_nat_entry_by_global(
+        &self,
+        proto: NatProtocolType,
+        ipaddr: u32,
+        port: u16,
+    ) -> Option<NatEntry> {
         match proto {
-            NatProtocolType::Udp => self.udp.iter().filter_map(|e| e.as_ref()).find(|v| v.global_ip_addr == ipaddr && v.global_port == port).cloned(),
-            NatProtocolType::Tcp => self.tcp.iter().filter_map(|e| e.as_ref()).find(|v| v.global_ip_addr == ipaddr && v.global_port == port).cloned(),
+            NatProtocolType::Udp => self
+                .udp
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|v| v.global_ip_addr == ipaddr && v.global_port == port)
+                .cloned(),
+            NatProtocolType::Tcp => self
+                .tcp
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|v| v.global_ip_addr == ipaddr && v.global_port == port)
+                .cloned(),
             NatProtocolType::Icmp => None,
         }
     }
 
-    pub fn get_nat_entry_by_local(&self, proto: NatProtocolType, ipaddr: u32, port: u16) -> Option<NatEntry> {
+    pub fn get_nat_entry_by_local(
+        &self,
+        proto: NatProtocolType,
+        ipaddr: u32,
+        port: u16,
+    ) -> Option<NatEntry> {
         match proto {
-            NatProtocolType::Udp => self.udp.iter().filter_map(|e| e.as_ref()).find(|v| v.local_ip_addr == ipaddr && v.local_port == port).cloned(),
-            NatProtocolType::Tcp => self.tcp.iter().filter_map(|e| e.as_ref()).find(|v| v.local_ip_addr == ipaddr && v.local_port == port).cloned(),
+            NatProtocolType::Udp => self
+                .udp
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|v| v.local_ip_addr == ipaddr && v.local_port == port)
+                .cloned(),
+            NatProtocolType::Tcp => self
+                .tcp
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|v| v.local_ip_addr == ipaddr && v.local_port == port)
+                .cloned(),
             NatProtocolType::Icmp => None,
         }
     }
@@ -173,7 +213,10 @@ impl NatEntryList {
             NatProtocolType::Udp => {
                 for (i, slot) in self.udp.iter_mut().enumerate() {
                     if slot.is_none() {
-                        *slot = Some(NatEntry { global_port: NAT_GLOBAL_PORT_MIN + i as u16, ..Default::default() });
+                        *slot = Some(NatEntry {
+                            global_port: NAT_GLOBAL_PORT_MIN + i as u16,
+                            ..Default::default()
+                        });
                         return slot.as_mut();
                     }
                 }
@@ -181,7 +224,10 @@ impl NatEntryList {
             NatProtocolType::Tcp => {
                 for (i, slot) in self.tcp.iter_mut().enumerate() {
                     if slot.is_none() {
-                        *slot = Some(NatEntry { global_port: NAT_GLOBAL_PORT_MIN + i as u16, ..Default::default() });
+                        *slot = Some(NatEntry {
+                            global_port: NAT_GLOBAL_PORT_MIN + i as u16,
+                            ..Default::default()
+                        });
                         return slot.as_mut();
                     }
                 }
@@ -214,7 +260,11 @@ pub fn configure_ip_nat(devices: &mut [NetDevice], inside_name: &str, outside_ip
                 outside_ip_addr: outside_ip,
                 nat_entry: NatEntryList::default(),
             };
-            println!("Set nat to {}, outside ip addr is {}", inside_name, print_ip_addr(outside_ip));
+            println!(
+                "Set nat to {}, outside ip addr is {}",
+                inside_name,
+                print_ip_addr(outside_ip)
+            );
         }
     }
 }
@@ -246,7 +296,6 @@ pub fn dump_nat_tables(devices: &[NetDevice]) {
     }
     println!("|-------|-----------------------|-----------------------|");
 }
-
 
 pub fn nat_exec(
     ipheader: &mut IpHeader,
@@ -283,9 +332,10 @@ pub fn nat_exec(
     match direction {
         NatDirectionType::Incoming => {
             // 外→内：グローバル (dstIP, dstPort) で引く
-            let entry_opt = natdevice
-                .nat_entry
-                .get_nat_entry_by_global(proto, ipheader.dest_addr, dest_port);
+            let entry_opt =
+                natdevice
+                    .nat_entry
+                    .get_nat_entry_by_global(proto, ipheader.dest_addr, dest_port);
             let entry = if let Some(e) = entry_opt {
                 e
             } else {
@@ -324,11 +374,14 @@ pub fn nat_exec(
 
             // 目的地 (global→local) に差し替え
             // 32bit IP と 16bit Port の差分を 1の補数和に反映
-            checksum = checksum.wrapping_add(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
-            checksum = checksum.wrapping_add((entry.local_port as u32).wrapping_sub(entry.global_port as u32));
+            checksum =
+                checksum.wrapping_add(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
+            checksum = checksum
+                .wrapping_add((entry.local_port as u32).wrapping_sub(entry.global_port as u32));
             checksum = (checksum & 0xFFFF) + (checksum >> 16);
 
-            ipchecksum = ipchecksum.wrapping_add(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
+            ipchecksum =
+                ipchecksum.wrapping_add(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
             ipheader.header_checksum = !(ipchecksum as u16);
 
             // L4 再配置
@@ -347,9 +400,10 @@ pub fn nat_exec(
 
         NatDirectionType::Outgoing => {
             // 内→外：ローカル (srcIP, srcPort) で引いて、なければエントリ作成
-            let maybe_entry = natdevice
-                .nat_entry
-                .get_nat_entry_by_local(proto, ipheader.src_addr, src_port);
+            let maybe_entry =
+                natdevice
+                    .nat_entry
+                    .get_nat_entry_by_local(proto, ipheader.src_addr, src_port);
 
             // 既存 or 新規
             let mut entry = if let Some(e) = maybe_entry {
@@ -398,11 +452,14 @@ pub fn nat_exec(
 
             let mut ipchecksum = (ipheader.header_checksum as u32) ^ 0xFFFF;
 
-            checksum = checksum.wrapping_sub(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
-            checksum = checksum.wrapping_sub((entry.local_port as u32).wrapping_sub(entry.global_port as u32));
+            checksum =
+                checksum.wrapping_sub(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
+            checksum = checksum
+                .wrapping_sub((entry.local_port as u32).wrapping_sub(entry.global_port as u32));
             checksum = (checksum & 0xFFFF) + (checksum >> 16);
 
-            ipchecksum = ipchecksum.wrapping_sub(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
+            ipchecksum =
+                ipchecksum.wrapping_sub(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
             // Go 版ではここで ipheader.headerChecksum を書き戻していません（その後に別箇所で再計算する想定）。
             // 同じ挙動に合わせてあえて書き戻しはしません。必要なら以下を有効化:
             // ipheader.header_checksum = !(ipchecksum as u16);

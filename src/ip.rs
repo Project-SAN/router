@@ -47,18 +47,12 @@ fn search_arp_table_entry(_ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
     ([0; 6], None)
 }
 
-fn add_arp_table_entry(_dev: &NetDevice, _ipaddr: u32, _macaddr: [u8; 6]) {
+fn add_arp_table_entry(_dev: &NetDevice, _ipaddr: u32, _macaddr: [u8; 6]) {}
 
-}
-
-fn send_arp_request(_dev: &NetDevice, _target_ip: u32) {
-
-}
+fn send_arp_request(_dev: &NetDevice, _target_ip: u32) {}
 
 //ethernet送信
-fn ethernet_output(_dev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], _ethertype: u16) {
-
-}
+fn ethernet_output(_dev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], _ethertype: u16) {}
 
 //NATまわり
 #[derive(Clone, Copy)]
@@ -184,7 +178,7 @@ fn print_ip_addr(ip: u32) -> String {
 pub fn subnet_to_prefix_len(netmask: u32) -> u32 {
     let mut prefix = 0;
     while prefix < 32 {
-        if((netmask >> (31 - prefix)) & 1) != 1 {
+        if ((netmask >> (31 - prefix)) & 1) != 1 {
             break;
         }
         prefix += 1;
@@ -263,7 +257,8 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
     }
 
     //自分宛orリミテッドブロードキャスト
-    if ipheader.dest_addr == IP_ADDRESS_LIMITED_BROADCAST || inputdev.ipdev.address == ipheader.dest_addr
+    if ipheader.dest_addr == IP_ADDRESS_LIMITED_BROADCAST
+        || inputdev.ipdev.address == ipheader.dest_addr
     {
         ip_input_to_ours(inputdev, &ipheader, &packet[20..]);
         return;
@@ -281,16 +276,20 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
     let mut nat_packet: Vec<u8> = Vec::new();
     if inputdev.ipdev.natdev != NatDevice::default() {
         let res = match ipheader.protocol {
-            IP_PROTOCOL_NUM_UDP => nat_exec (
+            IP_PROTOCOL_NUM_UDP => nat_exec(
                 &ipheader,
-                NatPacketHeader { packet: &packet[20..] },
+                NatPacketHeader {
+                    packet: &packet[20..],
+                },
                 &inputdev.ipdev.natdev,
                 NatProto::Udp,
                 NatDir::Outgoing,
             ),
-            IP_PROTOCOL_NUM_TCP => nat_exec (
+            IP_PROTOCOL_NUM_TCP => nat_exec(
                 &ipheader,
-                NatPacketHeader { packet: &packet[20..] },
+                NatPacketHeader {
+                    packet: &packet[20..],
+                },
                 &inputdev.ipdev.natdev,
                 NatProto::Tcp,
                 NatDir::Outgoing,
@@ -356,14 +355,14 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
             let mut nat_exected = false;
             let mut dest_packet = Vec::new();
             let res = match ipheader.protocol {
-                IP_PROTOCOL_NUM_UDP => nat_exec (
+                IP_PROTOCOL_NUM_UDP => nat_exec(
                     ipheader,
                     NatPacketHeader { packet: payload },
                     &dev.ipdev.natdev.clone(),
                     NatProto::Udp,
                     NatDir::Incoming,
                 ),
-                IP_PROTOCOL_NUM_TCP => nat_exec (
+                IP_PROTOCOL_NUM_TCP => nat_exec(
                     ipheader,
                     NatPacketHeader { packet: payload },
                     &dev.ipdev.natdev.clone(),
@@ -378,7 +377,7 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
                     dest_packet = p;
                 }
             } else {
-                return
+                return;
             }
 
             if nat_exected {
@@ -436,7 +435,8 @@ fn ip_packet_output_to_nexthop(next_hop: u32, packet: &[u8]) {
             print_ip_addr(next_hop)
         );
         let route_to_nexthop = iproute().radix_tree_search(next_hop);
-        if route_to_nexthop == IpRouteEntry::default() || route_to_nexthop.iptype != IpRouteType::Connected 
+        if route_to_nexthop == IpRouteEntry::default()
+            || route_to_nexthop.iptype != IpRouteType::Connected
         {
             println!("Next hop {} is not reachable", print_ip_addr(next_hop));
         } else {
