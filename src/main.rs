@@ -1,9 +1,7 @@
-use std::collections::BTreeMap;
-use std::ffi::CStr;
 use std::fs;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{value_parser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
@@ -13,6 +11,10 @@ use hornet::policy::{decode_metadata_tlv, PolicyCapsule, PolicyMetadata, PolicyR
 use hornet::time::TimeProvider;
 use hornet::types::Error as HornetError;
 use router::nat::{nat_exec, NatDevice, NatDirectionType, NatPacketHeader, NatProtocolType};
+use router::{
+    ethernet,
+    net::{self, NetDevice},
+};
 
 /// ルータ CLI（通常機能 + HORNET PoC）
 #[derive(Parser, Debug)]
@@ -63,6 +65,13 @@ enum RouterCommand {
         remote_ip: Ipv4Addr,
         #[arg(long)]
         remote_port: Option<u16>,
+    },
+    /// 指定インターフェースで Ethernet フレームを受信して表示
+    Sniff {
+        #[arg(long)]
+        iface: String,
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -143,6 +152,7 @@ fn run_router(args: RouterArgs) -> Result<()> {
             remote_ip,
             remote_port,
         ),
+        RouterCommand::Sniff { iface, limit } => run_sniff(iface, limit),
     }
 }
 
@@ -318,60 +328,20 @@ fn run_legacy_mode(mode: String) -> Result<()> {
 }
 
 fn show_interfaces() -> Result<()> {
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifaddrs) != 0 {
-            return Err(anyhow!("getifaddrs に失敗しました"));
-        }
-        let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut cursor = ifaddrs;
-        while !cursor.is_null() {
-            let iface = &*cursor;
-            let name = if iface.ifa_name.is_null() {
-                String::from("<unknown>")
-            } else {
-                CStr::from_ptr(iface.ifa_name)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            if let Some(addr) = sockaddr_to_string(iface.ifa_addr) {
-                map.entry(name).or_default().push(addr);
-            } else {
-                map.entry(name).or_default();
-            }
-            cursor = iface.ifa_next;
-        }
-        libc::freeifaddrs(ifaddrs);
-
-        println!("利用可能なインターフェース:");
-        for (name, addrs) in map {
-            if addrs.is_empty() {
-                println!("- {name}");
-            } else {
-                println!("- {name} ({})", addrs.join(", "));
-            }
+    let infos = net::list_interfaces()?;
+    println!("利用可能なインターフェース:");
+    for info in infos {
+        let mac = info
+            .mac
+            .map(|m| ethernet::format_mac(&m))
+            .unwrap_or_else(|| "(mac不明)".to_string());
+        if info.addresses.is_empty() {
+            println!("- {} {}", info.name, mac);
+        } else {
+            println!("- {} {} [{}]", info.name, mac, info.addresses.join(", "));
         }
     }
     Ok(())
-}
-
-unsafe fn sockaddr_to_string(addr: *const libc::sockaddr) -> Option<String> {
-    if addr.is_null() {
-        return None;
-    }
-    match (*addr).sa_family as libc::c_int {
-        libc::AF_INET => {
-            let sin = &*(addr as *const libc::sockaddr_in);
-            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-            Some(ip.to_string())
-        }
-        libc::AF_INET6 => {
-            let sin6 = &*(addr as *const libc::sockaddr_in6);
-            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-            Some(ip.to_string())
-        }
-        _ => None,
-    }
 }
 
 fn run_nat_simulation(
@@ -567,4 +537,31 @@ fn decode_ports(protocol: NatProtocolType, payload: &[u8]) -> Result<(u16, u16)>
 
 fn format_ipv4(ip: u32) -> String {
     Ipv4Addr::from(ip).to_string()
+}
+
+fn run_sniff(iface: String, limit: Option<usize>) -> Result<()> {
+    let mut device =
+        NetDevice::open(&iface).with_context(|| format!("{} をオープンできません", iface))?;
+    println!(
+        "sniffing on {} (MAC {})",
+        device.name,
+        ethernet::format_mac(&device.mac)
+    );
+    let mut buffer = vec![0u8; 2048];
+    let mut received = 0usize;
+    loop {
+        let n = device.recv(&mut buffer)?;
+        if n == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        ethernet::process_frame(&mut device, &buffer[..n]);
+        received += 1;
+        if let Some(max) = limit {
+            if received >= max {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
