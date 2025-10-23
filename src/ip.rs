@@ -1,5 +1,6 @@
+use crate::arp;
 use std::net::Ipv4Addr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 //定数
 pub const IP_ADDRESS_LEN: u8 = 4;
@@ -19,6 +20,8 @@ pub struct NatDevice {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EthernetHeader {
     pub src_addr: [u8; 6],
+    pub dest_addr: [u8; 6],
+    pub ether_type: u16,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -43,16 +46,16 @@ fn net_device_list() -> &'static Mutex<Vec<NetDevice>> {
 }
 
 //arpまわり
-fn search_arp_table_entry(_ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
-    ([0; 6], None)
+fn search_arp_table_entry(ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
+    arp::search_arp_table_entry(ipaddr)
 }
 
-fn add_arp_table_entry(_dev: &NetDevice, _ipaddr: u32, _macaddr: [u8; 6]) {
-
+fn add_arp_table_entry(dev: &NetDevice, ipaddr: u32, macaddr: [u8; 6]) {
+    arp::add_arp_table_entry(dev, ipaddr, macaddr)
 }
 
-fn send_arp_request(_dev: &NetDevice, _target_ip: u32) {
-
+fn send_arp_request(dev: &NetDevice, target_ip: u32) {
+    arp::send_arp_request(dev, target_ip)
 }
 
 //ethernet送信
@@ -106,16 +109,81 @@ pub struct IpRouteEntry {
 }
 
 //簡易ルート表
-#[derive(Clone, Default)]
-pub struct RouteTable;
-impl RouteTable {
-    pub fn radix_tree_search(&self, _dest: u32) -> IpRouteEntry {
-        IpRouteEntry::default()
+#[derive(Clone)]
+pub struct RouteTable {
+    inner: Arc<Mutex<Vec<RouteRecord>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteEntryConfig {
+    pub prefix: u32,
+    pub prefix_len: u8,
+    pub entry: IpRouteEntry,
+}
+
+#[derive(Clone, Debug)]
+struct RouteRecord {
+    prefix: u32,
+    prefix_len: u8,
+    netmask: u32,
+    entry: IpRouteEntry,
+}
+
+impl Default for RouteTable {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
+
+impl RouteTable {
+    fn replace_routes(&self, routes: Vec<RouteRecord>) -> Result<(), String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "route table mutex is poisoned".to_string())?;
+        *guard = routes;
+        Ok(())
+    }
+
+    pub fn radix_tree_search(&self, dest: u32) -> IpRouteEntry {
+        let Ok(guard) = self.inner.lock() else {
+            return IpRouteEntry::default();
+        };
+
+        let mut best: Option<&RouteRecord> = None;
+        for record in guard.iter() {
+            if (dest & record.netmask) == record.prefix {
+                match best {
+                    Some(current) if current.prefix_len >= record.prefix_len => {}
+                    _ => best = Some(record),
+                }
+            }
+        }
+        best.map(|r| r.entry.clone()).unwrap_or_default()
+    }
+}
+
 static IPROUTE: OnceLock<RouteTable> = OnceLock::new();
 fn iproute() -> &'static RouteTable {
     IPROUTE.get_or_init(RouteTable::default)
+}
+
+pub fn set_route_entries(routes: Vec<RouteEntryConfig>) -> Result<(), String> {
+    let mut records = Vec::with_capacity(routes.len());
+    for route in routes {
+        let Some(netmask) = prefix_to_netmask(route.prefix_len) else {
+            return Err(format!("invalid prefix length {}", route.prefix_len));
+        };
+        records.push(RouteRecord {
+            prefix: route.prefix & netmask,
+            prefix_len: route.prefix_len,
+            netmask,
+            entry: route.entry.clone(),
+        });
+    }
+    iproute().replace_routes(records)
 }
 
 //IPヘッダとユーティリティ
@@ -181,6 +249,16 @@ fn print_ip_addr(ip: u32) -> String {
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
 
+fn prefix_to_netmask(prefix: u8) -> Option<u32> {
+    if prefix > 32 {
+        return None;
+    }
+    if prefix == 0 {
+        return Some(0);
+    }
+    Some((!0u32).checked_shl(32 - prefix as u32).unwrap_or(0))
+}
+
 pub fn subnet_to_prefix_len(netmask: u32) -> u32 {
     let mut prefix = 0;
     while prefix < 32 {
@@ -200,7 +278,7 @@ pub fn get_ip_device(cidrs: &[&str]) -> IpDevice {
                 if let Ok(pfx) = pfx_s.parse::<u8>() {
                     let mask = (!0u32).checked_shl(32 - pfx as u32).unwrap_or(0);
                     ipdev.address = u32::from(ip);
-                    ipdev.netmask = mask.to_be();
+                    ipdev.netmask = mask;
                     ipdev.broadcast = ipdev.address | (!ipdev.netmask);
                     break;
                 }
@@ -422,6 +500,7 @@ fn ip_packet_output_to_host(dev: &NetDevice, dest_addr: u32, packet: &[u8]) {
             "Trying ip output to host, but no arp recoed to {}",
             print_ip_addr(dest_addr)
         );
+        arp::queue_pending_packet(dev, dest_addr, ETHER_TYPE_IP, packet);
         send_arp_request(dev, dest_addr);
     } else {
         ethernet_output(dev, dest_mac, packet, ETHER_TYPE_IP);
@@ -440,6 +519,7 @@ fn ip_packet_output_to_nexthop(next_hop: u32, packet: &[u8]) {
         {
             println!("Next hop {} is not reachable", print_ip_addr(next_hop));
         } else {
+            arp::queue_pending_packet(&route_to_nexthop.netdev, next_hop, ETHER_TYPE_IP, packet);
             send_arp_request(&route_to_nexthop.netdev, next_hop);
         }
     } else if let Some(dev) = dev {
@@ -472,7 +552,7 @@ pub fn ip_packet_encapsulate_output(
     protocol_type: u8,
 ) {
     let total_len = 20 + payload.len();
-    let mut ipheader = IpHeader {
+    let ipheader = IpHeader {
         version: 4,
         header_len: 20 / 4,
         tos: 0,
@@ -492,6 +572,7 @@ pub fn ip_packet_encapsulate_output(
     if dest_mac != [0u8; 6] {
         ethernet_output(inputdev, dest_mac, &ip_packet, ETHER_TYPE_IP);
     } else {
+        arp::queue_pending_packet(inputdev, dest_addr, ETHER_TYPE_IP, &ip_packet);
         send_arp_request(inputdev, dest_addr);
     }
 }
@@ -500,4 +581,80 @@ pub fn ip_packet_encapsulate_output(
 fn icmp_input(_dev: &NetDevice, _src: u32, _dst: u32, _icmp: &[u8]) {
     // 既に用意済みの icmp.rs の icmp_input をここにリンクしてください
     println!("(stub) icmp_input called, len={}", _icmp.len());
+}
+
+pub fn set_net_devices(devices: Vec<NetDevice>) -> Result<(), String> {
+    let list = net_device_list();
+    let mut guard = list
+        .lock()
+        .map_err(|_| "net_device_list mutex is poisoned".to_string())?;
+    *guard = devices;
+    Ok(())
+}
+
+pub fn get_net_devices() -> Result<Vec<NetDevice>, String> {
+    let list = net_device_list();
+    let guard = list
+        .lock()
+        .map_err(|_| "net_device_list mutex is poisoned".to_string())?;
+    Ok(guard.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn make_device(name: &str) -> NetDevice {
+        NetDevice {
+            name: name.to_string(),
+            ipdev: IpDevice::default(),
+            ethe_header: EthernetHeader::default(),
+            macaddr: [0u8; 6],
+        }
+    }
+
+    #[test]
+    fn selects_longest_prefix_match() {
+        let mut default_dev = make_device("eth0");
+        default_dev.ipdev.address = u32::from(Ipv4Addr::new(203, 0, 113, 2));
+
+        let mut lan_dev = make_device("eth1");
+        lan_dev.ipdev.address = u32::from(Ipv4Addr::new(192, 168, 10, 1));
+
+        set_route_entries(vec![
+            RouteEntryConfig {
+                prefix: 0,
+                prefix_len: 0,
+                entry: IpRouteEntry {
+                    iptype: IpRouteType::Network,
+                    netdev: default_dev.clone(),
+                    nexthop: u32::from(Ipv4Addr::new(203, 0, 113, 1)),
+                },
+            },
+            RouteEntryConfig {
+                prefix: u32::from(Ipv4Addr::new(192, 168, 10, 0)),
+                prefix_len: 24,
+                entry: IpRouteEntry {
+                    iptype: IpRouteType::Connected,
+                    netdev: lan_dev.clone(),
+                    nexthop: 0,
+                },
+            },
+        ])
+        .unwrap();
+
+        let table = super::iproute();
+        let lan_route =
+            table.radix_tree_search(u32::from(Ipv4Addr::new(192, 168, 10, 42)));
+        assert_eq!(lan_route.iptype, IpRouteType::Connected);
+        assert_eq!(lan_route.netdev.name, "eth1");
+
+        let default_route = table.radix_tree_search(u32::from(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(default_route.iptype, IpRouteType::Network);
+        assert_eq!(
+            default_route.nexthop,
+            u32::from(Ipv4Addr::new(203, 0, 113, 1))
+        );
+    }
 }

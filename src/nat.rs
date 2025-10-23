@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NatDirectionType {
@@ -143,14 +142,6 @@ fn print_ip_addr(ip: u32) -> String {
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
 
-fn hex(data: &[u8]) -> String {
-    let mut s = String::new();
-    for b in data {
-        let _ = write!(&mut s, "{:02x}", b);
-    }
-    s
-}
-
 impl NatEntryList {
     pub fn get_nat_entry_by_global(&self, proto: NatProtocolType, ipaddr: u32, port: u16) -> Option<NatEntry> {
         match proto {
@@ -189,21 +180,6 @@ impl NatEntryList {
             NatProtocolType::Icmp => {}
         }
         None
-    }
-    fn replace_entry(&mut self, proto: NatProtocolType, old: &NatEntry, new_ent: NatEntry) {
-        let vec_ref: &mut Vec<Option<NatEntry>> = match proto {
-            NatProtocolType::Udp => &mut self.udp,
-            NatProtocolType::Tcp => &mut self.tcp,
-            NatProtocolType::Icmp => return,
-        };
-        for slot in vec_ref.iter_mut() {
-            if let Some(e) = slot {
-                if e.global_port == old.global_port && e.global_ip_addr == old.global_ip_addr {
-                    *e = new_ent;
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -261,23 +237,21 @@ pub fn nat_exec(
     }
 
     // UDP/TCP をパース
-    let mut udpheader = UdpHeader::default();
-    let mut tcpheader = TcpHeader::default();
-    let mut src_port = 0;
-    let mut dest_port = 0;
-    match proto {
+    let mut udpheader;
+    let mut tcpheader;
+    let (src_port, dest_port) = match proto {
         NatProtocolType::Udp => {
             udpheader = UdpHeader::parse_packet(nat_packet.packet);
-            src_port = udpheader.src_port;
-            dest_port = udpheader.dest_port;
+            tcpheader = TcpHeader::default();
+            (udpheader.src_port, udpheader.dest_port)
         }
         NatProtocolType::Tcp => {
             tcpheader = TcpHeader::parse_packet(nat_packet.packet);
-            src_port = tcpheader.src_port;
-            dest_port = tcpheader.dest_port;
+            udpheader = UdpHeader::default();
+            (tcpheader.src_port, tcpheader.dest_port)
         }
         NatProtocolType::Icmp => unreachable!(),
-    }
+    };
 
     // エントリ参照/作成
     match direction {
@@ -352,7 +326,7 @@ pub fn nat_exec(
                 .get_nat_entry_by_local(proto, ipheader.src_addr, src_port);
 
             // 既存 or 新規
-            let mut entry = if let Some(e) = maybe_entry {
+            let entry = if let Some(e) = maybe_entry {
                 e
             } else {
                 // 空きスロットに作成
@@ -403,9 +377,7 @@ pub fn nat_exec(
             checksum = (checksum & 0xFFFF) + (checksum >> 16);
 
             ipchecksum = ipchecksum.wrapping_sub(entry.local_ip_addr.wrapping_sub(entry.global_ip_addr));
-            // Go 版ではここで ipheader.headerChecksum を書き戻していません（その後に別箇所で再計算する想定）。
-            // 同じ挙動に合わせてあえて書き戻しはしません。必要なら以下を有効化:
-            // ipheader.header_checksum = !(ipchecksum as u16);
+            ipheader.header_checksum = !(ipchecksum as u16);
 
             // L4 再配置
             let out = match proto {
