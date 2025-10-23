@@ -1,5 +1,6 @@
 use clap::Parser;
 use router::config::{self, CliOverrides};
+use router::control;
 use router::ip;
 use router::runtime;
 use std::path::PathBuf;
@@ -69,6 +70,8 @@ fn main() {
             eprintln!("warning: unable to list raw sockets: {err}");
         }
     }
+
+    control::spawn_control_plane();
 
     if runtime::has_runtime_devices() {
         if let Err(err) = runtime::run_event_loop(&router_config.mode) {

@@ -182,6 +182,11 @@ pub fn search_arp_table_entry(ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
     ([0u8; 6], None)
 }
 
+pub fn snapshot_arp_table() -> Vec<ArpTableEntry> {
+    let table = arp_table().lock().unwrap();
+    table.clone()
+}
+
 fn flush_pending_packets(ipaddr: u32, macaddr: [u8; 6]) {
     let packets = {
         let mut queue = pending_packets().lock().unwrap();

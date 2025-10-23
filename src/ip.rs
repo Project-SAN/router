@@ -1,4 +1,5 @@
 use crate::arp;
+use crate::icmp;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -244,7 +245,7 @@ fn calc_checksum(buf: &[u8]) -> [u8; 2] {
     (!sum as u16).to_be_bytes()
 }
 
-fn print_ip_addr(ip: u32) -> String {
+pub fn print_ip_addr(ip: u32) -> String {
     let b = ip.to_be_bytes();
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
@@ -578,9 +579,8 @@ pub fn ip_packet_encapsulate_output(
 }
 
 //ICMP入力
-fn icmp_input(_dev: &NetDevice, _src: u32, _dst: u32, _icmp: &[u8]) {
-    // 既に用意済みの icmp.rs の icmp_input をここにリンクしてください
-    println!("(stub) icmp_input called, len={}", _icmp.len());
+fn icmp_input(dev: &NetDevice, src: u32, dst: u32, icmp_packet: &[u8]) {
+    icmp::icmp_input(dev, src, dst, icmp_packet);
 }
 
 pub fn set_net_devices(devices: Vec<NetDevice>) -> Result<(), String> {

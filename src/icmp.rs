@@ -1,3 +1,4 @@
+use crate::ip::{self, NetDevice};
 use std::fmt::Write as _;
 
 pub const ICMP_TYPE_ECHO_REPLY: u8 = 0;
@@ -6,21 +7,6 @@ pub const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
 pub const ICMP_TYPE_TIME_EXCEEDED: u8 = 11;
 
 pub const IP_PROTOCOL_NUM_ICMP: u8 = 1;
-
-#[derive(Clone, Debug)]
-pub struct NetDevice {
-    pub name: String,
-}
-
-fn ip_packet_encapsulate_output(
-    _dev: &NetDevice,
-    _src: u32,
-    _dst: u32,
-    _payload: &[u8],
-    _protocol: u8,
-){
-    //ここでIPヘッダをつけて送信
-}
 
 //型定義
 #[derive(Clone, Copy, Debug)]
@@ -223,7 +209,7 @@ pub fn icmp_input(inputdev: &NetDevice, source_addr: u32, dest_addr: u32, icmp_p
             println!("ICMP ECHO REQUEST is received, Create Reply Packet");
             let reply = icmpmsg.reply_packet();
             if !reply.is_empty() {
-                ip_packet_encapsulate_output(
+                ip::ip_packet_encapsulate_output(
                     inputdev,
                     source_addr,
                     dest_addr,
