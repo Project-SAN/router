@@ -1,10 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RouterConfig {
     pub mode: String,
     pub debug_level: String,
@@ -13,7 +13,7 @@ pub struct RouterConfig {
     pub routes: Vec<RouteConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceConfig {
     pub name: String,
     pub enabled: bool,
@@ -24,19 +24,19 @@ pub struct DeviceConfig {
     pub nat: Option<DeviceNatConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceNatConfig {
     pub role: NatRole,
     pub outside_ip: Option<Ipv4Addr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum NatRole {
     Inside,
     Outside,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RouteConfig {
     pub destination: Ipv4Network,
     pub next_hop: Option<Ipv4Addr>,
@@ -44,7 +44,7 @@ pub struct RouteConfig {
     pub metric: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Ipv4Network {
     pub address: Ipv4Addr,
     pub prefix: u8,

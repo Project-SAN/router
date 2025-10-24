@@ -71,7 +71,7 @@ fn main() {
         }
     }
 
-    control::spawn_control_plane();
+    control::spawn_control_plane(router_config.clone());
 
     if runtime::has_runtime_devices() {
         if let Err(err) = runtime::run_event_loop(&router_config.mode) {
