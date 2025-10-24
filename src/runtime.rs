@@ -11,7 +11,7 @@ use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -29,14 +29,28 @@ pub enum InitError {
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InitError::MissingPrimaryAddress(dev) => write!(f, "device `{}` has no IPv4 address", dev),
-            InitError::InvalidNetmaskPrefix { device, prefix } => {
-                write!(f, "device `{}` has invalid prefix length `{}`", device, prefix)
+            InitError::MissingPrimaryAddress(dev) => {
+                write!(f, "device `{}` has no IPv4 address", dev)
             }
-            InitError::MissingOutsideNatPeer(dev) => write!(f, "device `{}` is configured for NAT inside but no outside peer is defined", dev),
+            InitError::InvalidNetmaskPrefix { device, prefix } => {
+                write!(
+                    f,
+                    "device `{}` has invalid prefix length `{}`",
+                    device, prefix
+                )
+            }
+            InitError::MissingOutsideNatPeer(dev) => write!(
+                f,
+                "device `{}` is configured for NAT inside but no outside peer is defined",
+                dev
+            ),
             InitError::RouteBuild(msg) => write!(f, "route configuration error: {}", msg),
             InitError::SocketInit { device, source } => {
-                write!(f, "failed to initialise raw socket for `{}`: {}", device, source)
+                write!(
+                    f,
+                    "failed to initialise raw socket for `{}`: {}",
+                    device, source
+                )
             }
             InitError::DeviceRegistry(msg) => write!(f, "device registry error: {}", msg),
             InitError::IpModule(err) => write!(f, "failed to update IP module devices: {}", err),
@@ -72,7 +86,9 @@ pub fn initialize_network_state(cfg: &RouterConfig) -> Result<(), InitError> {
     Ok(())
 }
 
-fn collect_outside_nat_ips(devices: &[&DeviceConfig]) -> Result<HashMap<String, Ipv4Addr>, InitError> {
+fn collect_outside_nat_ips(
+    devices: &[&DeviceConfig],
+) -> Result<HashMap<String, Ipv4Addr>, InitError> {
     let mut map = HashMap::new();
     for dev in devices {
         if let Some(nat) = &dev.nat {
@@ -95,6 +111,7 @@ fn build_ip_devices(
 ) -> Result<Vec<IpNetDevice>, InitError> {
     let mut result = Vec::with_capacity(devices.len());
     let fallback_outside_ip = outside_ip_map.values().next().copied();
+    let mut nat_states: HashMap<u32, Arc<Mutex<crate::nat::NatDevice>>> = HashMap::new();
 
     for dev in devices {
         let primary = dev
@@ -102,8 +119,11 @@ fn build_ip_devices(
             .first()
             .ok_or_else(|| InitError::MissingPrimaryAddress(dev.name.clone()))?;
 
-        let mask = prefix_to_netmask(primary.prefix)
-            .ok_or_else(|| InitError::InvalidNetmaskPrefix { device: dev.name.clone(), prefix: primary.prefix })?;
+        let mask =
+            prefix_to_netmask(primary.prefix).ok_or_else(|| InitError::InvalidNetmaskPrefix {
+                device: dev.name.clone(),
+                prefix: primary.prefix,
+            })?;
         let address = u32::from(primary.address);
         let broadcast = address | (!mask);
 
@@ -117,19 +137,27 @@ fn build_ip_devices(
         };
 
         if let Some(nat_cfg) = &dev.nat {
-            match nat_cfg.role {
-                NatRole::Outside => {
-                    let outside_ip = nat_cfg.outside_ip.unwrap_or(primary.address);
-                    ipdev.natdev.outside_ip_addr = u32::from(outside_ip);
-                }
-                NatRole::Inside => {
-                    let outside_ip = nat_cfg
-                        .outside_ip
-                        .or(fallback_outside_ip)
-                        .ok_or_else(|| InitError::MissingOutsideNatPeer(dev.name.clone()))?;
-                    ipdev.natdev.outside_ip_addr = u32::from(outside_ip);
-                }
-            }
+            let outside_ip = match nat_cfg.role {
+                NatRole::Outside => nat_cfg.outside_ip.unwrap_or(primary.address),
+                NatRole::Inside => nat_cfg
+                    .outside_ip
+                    .or(fallback_outside_ip)
+                    .ok_or_else(|| InitError::MissingOutsideNatPeer(dev.name.clone()))?,
+            };
+            let outside_ip_u32 = u32::from(outside_ip);
+            let state = nat_states
+                .entry(outside_ip_u32)
+                .or_insert_with(|| {
+                    let mut nat_dev = crate::nat::NatDevice::default();
+                    nat_dev.outside_ip_addr = outside_ip_u32;
+                    Arc::new(Mutex::new(nat_dev))
+                })
+                .clone();
+
+            ipdev.natdev = match nat_cfg.role {
+                NatRole::Outside => IpNatDevice::for_outside(outside_ip_u32, state),
+                NatRole::Inside => IpNatDevice::for_inside(outside_ip_u32, state),
+            };
         }
 
         let mut ethernet_header = IpEthernetHeader::default();
@@ -153,21 +181,17 @@ fn build_route_entries(
     let mut result = Vec::with_capacity(routes.len());
 
     for route in routes {
-        let interface_name = route
-            .interface
-            .as_ref()
-            .ok_or_else(|| InitError::RouteBuild(format!(
+        let interface_name = route.interface.as_ref().ok_or_else(|| {
+            InitError::RouteBuild(format!(
                 "route to {}/{} requires `interface`",
-                route.destination.address,
-                route.destination.prefix
-            )))?;
+                route.destination.address, route.destination.prefix
+            ))
+        })?;
 
         let Some(dev) = device_index.get(interface_name) else {
             eprintln!(
                 "warning: skipping route {}/{} because interface `{}` is not initialised",
-                route.destination.address,
-                route.destination.prefix,
-                interface_name
+                route.destination.address, route.destination.prefix, interface_name
             );
             continue;
         };
@@ -251,7 +275,9 @@ fn initialise_raw_devices(
     for iface in device_index.values() {
         match open_raw_socket(iface) {
             Ok(dev) => result.push(dev),
-            Err(InitError::SocketInit { device, source }) if source.kind() == io::ErrorKind::PermissionDenied => {
+            Err(InitError::SocketInit { device, source })
+                if source.kind() == io::ErrorKind::PermissionDenied =>
+            {
                 eprintln!(
                     "warning: insufficient permissions to open raw socket on `{}`: {}",
                     device, source
@@ -274,11 +300,12 @@ fn open_raw_socket(iface: &IpNetDevice) -> Result<RawSocketDevice, InitError> {
         });
     }
 
-    let c_name = CString::new(iface.name.clone()).map_err(|_| {
-        InitError::SocketInit {
-            device: iface.name.clone(),
-            source: io::Error::new(io::ErrorKind::InvalidInput, "interface name contains null byte"),
-        }
+    let c_name = CString::new(iface.name.clone()).map_err(|_| InitError::SocketInit {
+        device: iface.name.clone(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name contains null byte",
+        ),
     })?;
 
     let if_index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
@@ -443,25 +470,13 @@ fn recv_from_device(dev: &mut RawSocketDevice, mode: &str) -> Result<bool, Strin
             let err = io::Error::last_os_error();
             match err.kind() {
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => break,
-                _ => {
-                    match err.raw_os_error() {
-                        Some(code) if code == libc::ENETDOWN || code == libc::ENETRESET => {
-                            eprintln!(
-                                "warning: interface {} is down: {}",
-                                dev.name(),
-                                err
-                            );
-                            break;
-                        }
-                        _ => {
-                            return Err(format!(
-                                "recv error on {}: {}",
-                                dev.name(),
-                                err
-                            ))
-                        }
+                _ => match err.raw_os_error() {
+                    Some(code) if code == libc::ENETDOWN || code == libc::ENETRESET => {
+                        eprintln!("warning: interface {} is down: {}", dev.name(), err);
+                        break;
                     }
-                }
+                    _ => return Err(format!("recv error on {}: {}", dev.name(), err)),
+                },
             }
         } else if n == 0 {
             break;
@@ -489,7 +504,12 @@ mod tests {
     use crate::config::{DeviceNatConfig, Ipv4Network};
     use std::net::Ipv4Addr;
 
-    fn mk_device(name: &str, addr: (u8, u8, u8, u8), prefix: u8, nat: Option<DeviceNatConfig>) -> DeviceConfig {
+    fn mk_device(
+        name: &str,
+        addr: (u8, u8, u8, u8),
+        prefix: u8,
+        nat: Option<DeviceNatConfig>,
+    ) -> DeviceConfig {
         DeviceConfig {
             name: name.to_string(),
             enabled: true,

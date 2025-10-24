@@ -28,14 +28,13 @@ fn main() {
         debug_level: args.debug.clone(),
     };
 
-    let router_config =
-        match config::init_router_config(&args.config, overrides) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!("failed to load configuration: {err}");
-                std::process::exit(1);
-            }
-        };
+    let router_config = match config::init_router_config(&args.config, overrides) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("failed to load configuration: {err}");
+            std::process::exit(1);
+        }
+    };
 
     println!(
         "configuration loaded from {:?}: mode={}, debug_level={}, devices={}, routes={}",

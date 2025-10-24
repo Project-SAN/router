@@ -241,10 +241,9 @@ fn parse_ipv4_network(input: &str) -> Result<Ipv4Network, ConfigError> {
         .split_once('/')
         .ok_or_else(|| ConfigError::InvalidValue(format!("CIDR must contain `/`: {}", input)))?;
     let address = parse_ipv4_addr(addr_str.trim())?;
-    let prefix = prefix_str
-        .trim()
-        .parse::<u8>()
-        .map_err(|e| ConfigError::InvalidValue(format!("invalid prefix `{}`: {}", prefix_str, e)))?;
+    let prefix = prefix_str.trim().parse::<u8>().map_err(|e| {
+        ConfigError::InvalidValue(format!("invalid prefix `{}`: {}", prefix_str, e))
+    })?;
     if prefix > 32 {
         return Err(ConfigError::InvalidValue(format!(
             "prefix must be <= 32: {}",

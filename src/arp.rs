@@ -76,8 +76,12 @@ pub struct ArpIPToEthernet {
 }
 
 //バイト変換ヘルパ
-fn u16_to_be_bytes(x: u16) -> [u8; 2] { x.to_be_bytes() }
-fn u32_to_be_bytes(x: u32) -> [u8; 4] { x.to_be_bytes() }
+fn u16_to_be_bytes(x: u16) -> [u8; 2] {
+    x.to_be_bytes()
+}
+fn u32_to_be_bytes(x: u32) -> [u8; 4] {
+    x.to_be_bytes()
+}
 fn be_bytes_to_u16(bytes: &[u8]) -> u16 {
     let mut arr = [0u8; 2];
     arr.copy_from_slice(&bytes[0..2]);
@@ -103,7 +107,7 @@ fn print_ip_addr(ip: u32) -> String {
 
 fn print_mac_addr(mac: [u8; 6]) -> String {
     let mut s = String::new();
-    for(i, b) in mac.iter().enumerate() {
+    for (i, b) in mac.iter().enumerate() {
         let _ = write!(&mut s, "{:02x}{}", b, if i < 5 { ":" } else { "" });
     }
     s
@@ -208,10 +212,7 @@ fn flush_pending_packets(ipaddr: u32, macaddr: [u8; 6]) {
     for packet in packets {
         if let Some(dev) = devices.iter().find(|d| d.name == packet.interface) {
             if let Err(err) = ethernet_output(dev, macaddr, &packet.payload, packet.ethertype) {
-                eprintln!(
-                    "failed to flush pending packet on {}: {}",
-                    dev.name, err
-                );
+                eprintln!("failed to flush pending packet on {}: {}", dev.name, err);
                 unsent.push(packet);
             }
         } else {
@@ -259,7 +260,7 @@ pub fn arp_input(netdev: &NetDevice, packet: &[u8]) {
                 arp_reply_arrives(netdev, &arp_msg);
             }
         }
-        _ => {/*他のプロトコルは無視*/}
+        _ => { /*他のプロトコルは無視*/ }
     }
 }
 
@@ -286,13 +287,9 @@ pub fn arp_request_arrives(netdev: &NetDevice, arp: &ArpIPToEthernet) {
         }
         .to_packet();
 
-        if let Err(err) =
-            ethernet_output(netdev, arp.sender_hardware_addr, &reply, ETHER_TYPE_ARP)
+        if let Err(err) = ethernet_output(netdev, arp.sender_hardware_addr, &reply, ETHER_TYPE_ARP)
         {
-            eprintln!(
-                "failed to send arp reply on {}: {}",
-                netdev.name, err
-            );
+            eprintln!("failed to send arp reply on {}: {}", netdev.name, err);
         }
     }
 }
@@ -327,15 +324,7 @@ pub fn send_arp_request(netdev: &NetDevice, target_ip: u32) {
     }
     .to_packet();
 
-    if let Err(err) = ethernet_output(
-        netdev,
-        ETHERNET_ADDRESS_BROADCAST,
-        &req,
-        ETHER_TYPE_ARP,
-    ) {
-        eprintln!(
-            "failed to send arp request on {}: {}",
-            netdev.name, err
-        );
+    if let Err(err) = ethernet_output(netdev, ETHERNET_ADDRESS_BROADCAST, &req, ETHER_TYPE_ARP) {
+        eprintln!("failed to send arp request on {}: {}", netdev.name, err);
     }
 }

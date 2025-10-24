@@ -38,20 +38,18 @@ fn handle_command(cmd: &str, state: &Arc<Mutex<ControlState>>) -> Result<(), Str
     };
 
     match first {
-        "show" => {
-            match parts.next() {
-                Some("interfaces") => {
-                    show_interfaces();
-                    Ok(())
-                }
-                Some("arp") => {
-                    show_arp();
-                    Ok(())
-                }
-                Some("config") => show_config(state),
-                other => Err(format!("unknown show target `{}`", other.unwrap_or(""))),
+        "show" => match parts.next() {
+            Some("interfaces") => {
+                show_interfaces();
+                Ok(())
             }
-        }
+            Some("arp") => {
+                show_arp();
+                Ok(())
+            }
+            Some("config") => show_config(state),
+            other => Err(format!("unknown show target `{}`", other.unwrap_or(""))),
+        },
         "set" => handle_set(parts, state),
         "write" => write_config(state),
         "discard" => discard_changes(state),
@@ -63,9 +61,7 @@ fn handle_command(cmd: &str, state: &Arc<Mutex<ControlState>>) -> Result<(), Str
             println!("Type Ctrl+C to stop the router");
             Ok(())
         }
-        other => {
-            Err(format!("unknown command `{}`", other))
-        }
+        other => Err(format!("unknown command `{}`", other)),
     }
 }
 
@@ -106,7 +102,9 @@ fn show_arp() {
 }
 
 fn show_config(state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
-    let guard = state.lock().map_err(|_| "control state poisoned".to_string())?;
+    let guard = state
+        .lock()
+        .map_err(|_| "control state poisoned".to_string())?;
     let yaml = serde_yaml::to_string(&guard.working).map_err(|e| e.to_string())?;
     println!("{}", yaml);
     if guard.dirty {
@@ -115,7 +113,10 @@ fn show_config(state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
     Ok(())
 }
 
-fn handle_set<'a>(mut parts: impl Iterator<Item = &'a str>, state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
+fn handle_set<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+    state: &Arc<Mutex<ControlState>>,
+) -> Result<(), String> {
     let Some(category) = parts.next() else {
         return Err("set what? try `set interface <name> address <cidr>`".into());
     };
@@ -125,7 +126,10 @@ fn handle_set<'a>(mut parts: impl Iterator<Item = &'a str>, state: &Arc<Mutex<Co
     }
 }
 
-fn set_interface<'a>(mut parts: impl Iterator<Item = &'a str>, state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
+fn set_interface<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+    state: &Arc<Mutex<ControlState>>,
+) -> Result<(), String> {
     let Some(name) = parts.next() else {
         return Err("missing interface name".into());
     };
@@ -139,7 +143,9 @@ fn set_interface<'a>(mut parts: impl Iterator<Item = &'a str>, state: &Arc<Mutex
                 return Err("missing CIDR".into());
             };
             let network = parse_cidr(cidr)?;
-            let mut guard = state.lock().map_err(|_| "control state poisoned".to_string())?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| "control state poisoned".to_string())?;
             let dev = guard
                 .working
                 .devices
@@ -157,7 +163,9 @@ fn set_interface<'a>(mut parts: impl Iterator<Item = &'a str>, state: &Arc<Mutex
 }
 
 fn write_config(state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|_| "control state poisoned".to_string())?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| "control state poisoned".to_string())?;
     let yaml = serde_yaml::to_string(&guard.working).map_err(|e| e.to_string())?;
     std::fs::write(&guard.working.config_path, yaml).map_err(|e| e.to_string())?;
     guard.saved = guard.working.clone();
@@ -167,7 +175,9 @@ fn write_config(state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
 }
 
 fn discard_changes(state: &Arc<Mutex<ControlState>>) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|_| "control state poisoned".to_string())?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| "control state poisoned".to_string())?;
     guard.working = guard.saved.clone();
     guard.dirty = false;
     println!("reverted to last saved configuration");
@@ -184,7 +194,10 @@ fn parse_cidr(cidr: &str) -> Result<Ipv4Network, String> {
     let prefix: u8 = prefix_str
         .parse()
         .map_err(|e| format!("invalid prefix `{}`: {}", prefix_str, e))?;
-    Ok(Ipv4Network { address: addr, prefix })
+    Ok(Ipv4Network {
+        address: addr,
+        prefix,
+    })
 }
 
 fn print_help() {

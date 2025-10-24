@@ -1,5 +1,6 @@
 use crate::arp;
 use crate::icmp;
+use crate::nat;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -13,9 +14,62 @@ pub const IP_PROTOCOL_NUM_UDP: u8 = 0x11;
 pub const ETHER_TYPE_IP: u16 = 0x0800;
 pub const ETHER_TYPE_ARP: u16 = 0x0806;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct NatDevice {
     pub outside_ip_addr: u32,
+    role: NatInterfaceRole,
+    state: Option<Arc<Mutex<nat::NatDevice>>>,
+}
+
+impl PartialEq for NatDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.outside_ip_addr == other.outside_ip_addr && self.role == other.role
+    }
+}
+
+impl Eq for NatDevice {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NatInterfaceRole {
+    None,
+    Inside,
+    Outside,
+}
+
+impl Default for NatDevice {
+    fn default() -> Self {
+        Self {
+            outside_ip_addr: 0,
+            role: NatInterfaceRole::None,
+            state: None,
+        }
+    }
+}
+
+impl NatDevice {
+    pub(crate) fn for_inside(outside_ip_addr: u32, state: Arc<Mutex<nat::NatDevice>>) -> Self {
+        Self {
+            outside_ip_addr,
+            role: NatInterfaceRole::Inside,
+            state: Some(state),
+        }
+    }
+
+    pub(crate) fn for_outside(outside_ip_addr: u32, state: Arc<Mutex<nat::NatDevice>>) -> Self {
+        Self {
+            outside_ip_addr,
+            role: NatInterfaceRole::Outside,
+            state: Some(state),
+        }
+    }
+
+    fn is_inside(&self) -> bool {
+        matches!(self.role, NatInterfaceRole::Inside)
+    }
+
+    fn shared_state(&self) -> Option<Arc<Mutex<nat::NatDevice>>> {
+        self.state.as_ref().map(Arc::clone)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -60,8 +114,10 @@ fn send_arp_request(dev: &NetDevice, target_ip: u32) {
 }
 
 //ethernet送信
-fn ethernet_output(_dev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], _ethertype: u16) {
-
+fn ethernet_output(dev: &NetDevice, dst_mac: [u8; 6], payload: &[u8], ethertype: u16) {
+    if let Err(err) = crate::ethernet::ethernet_output(dev, dst_mac, payload, ethertype) {
+        eprintln!("failed to transmit ethernet frame on {}: {}", dev.name, err);
+    }
 }
 
 //NATまわり
@@ -80,13 +136,48 @@ struct NatPacketHeader<'a> {
 }
 
 fn nat_exec(
-    _ip: &IpHeader,
-    _pkt: NatPacketHeader<'_>,
-    _natdev: &NatDevice,
-    _proto: NatProto,
-    _dir: NatDir,
+    ip: &mut IpHeader,
+    pkt: NatPacketHeader<'_>,
+    natdev: &NatDevice,
+    proto: NatProto,
+    dir: NatDir,
 ) -> Result<Vec<u8>, String> {
-    Ok(_pkt.packet.to_vec())
+    let Some(state) = natdev.shared_state() else {
+        return Ok(pkt.packet.to_vec());
+    };
+    let mut guard = state
+        .lock()
+        .map_err(|_| "nat state is poisoned".to_string())?;
+
+    let mut nat_header = nat::IpHeader {
+        header_checksum: ip.header_checksum,
+        src_addr: ip.src_addr,
+        dest_addr: ip.dest_addr,
+    };
+
+    let nat_proto = match proto {
+        NatProto::Udp => nat::NatProtocolType::Udp,
+        NatProto::Tcp => nat::NatProtocolType::Tcp,
+    };
+
+    let nat_dir = match dir {
+        NatDir::Outgoing => nat::NatDirectionType::Outgoing,
+        NatDir::Incoming => nat::NatDirectionType::Incoming,
+    };
+
+    let result = nat::nat_exec(
+        &mut nat_header,
+        nat::NatPacketHeader { packet: pkt.packet },
+        &mut *guard,
+        nat_proto,
+        nat_dir,
+    )?;
+
+    ip.header_checksum = nat_header.header_checksum;
+    ip.src_addr = nat_header.src_addr;
+    ip.dest_addr = nat_header.dest_addr;
+
+    Ok(result)
 }
 
 //ルーティング
@@ -263,7 +354,7 @@ fn prefix_to_netmask(prefix: u8) -> Option<u32> {
 pub fn subnet_to_prefix_len(netmask: u32) -> u32 {
     let mut prefix = 0;
     while prefix < 32 {
-        if((netmask >> (31 - prefix)) & 1) != 1 {
+        if ((netmask >> (31 - prefix)) & 1) != 1 {
             break;
         }
         prefix += 1;
@@ -342,7 +433,8 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
     }
 
     //自分宛orリミテッドブロードキャスト
-    if ipheader.dest_addr == IP_ADDRESS_LIMITED_BROADCAST || inputdev.ipdev.address == ipheader.dest_addr
+    if ipheader.dest_addr == IP_ADDRESS_LIMITED_BROADCAST
+        || inputdev.ipdev.address == ipheader.dest_addr
     {
         ip_input_to_ours(inputdev, &ipheader, &packet[20..]);
         return;
@@ -356,20 +448,41 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
         }
     }
 
-    //NAT
-    let mut nat_packet: Vec<u8> = Vec::new();
-    if inputdev.ipdev.natdev != NatDevice::default() {
-        let res = match ipheader.protocol {
-            IP_PROTOCOL_NUM_UDP => nat_exec (
-                &ipheader,
-                NatPacketHeader { packet: &packet[20..] },
+    //ルーティング
+    let route = iproute().radix_tree_search(ipheader.dest_addr);
+    if route == IpRouteEntry::default() {
+        eprintln!("No route to host: {}", print_ip_addr(ipheader.dest_addr));
+        send_icmp_destination_unreachable(inputdev, &ipheader, packet);
+        return;
+    }
+
+    //TTL処理
+    if ipheader.ttl <= 1 {
+        //ToDo: ICMP Time Exceeded
+        send_icmp_time_exceeded(inputdev, &ipheader, packet);
+        return;
+    }
+    let mut ipheader2 = ipheader.clone();
+    ipheader2.ttl -= 1;
+    ipheader2.header_checksum = 0;
+
+    let mut translated_payload: Option<Vec<u8>> = None;
+    if inputdev.ipdev.natdev.is_inside() {
+        let res = match ipheader2.protocol {
+            IP_PROTOCOL_NUM_UDP => nat_exec(
+                &mut ipheader2,
+                NatPacketHeader {
+                    packet: &packet[20..],
+                },
                 &inputdev.ipdev.natdev,
                 NatProto::Udp,
                 NatDir::Outgoing,
             ),
-            IP_PROTOCOL_NUM_TCP => nat_exec (
-                &ipheader,
-                NatPacketHeader { packet: &packet[20..] },
+            IP_PROTOCOL_NUM_TCP => nat_exec(
+                &mut ipheader2,
+                NatPacketHeader {
+                    packet: &packet[20..],
+                },
                 &inputdev.ipdev.natdev,
                 NatProto::Tcp,
                 NatDir::Outgoing,
@@ -377,7 +490,8 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
             _ => Ok(Vec::new()),
         };
         match res {
-            Ok(p) => nat_packet = p,
+            Ok(p) if !p.is_empty() => translated_payload = Some(p),
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("nat packet err: {}", e);
                 return;
@@ -385,29 +499,14 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
         }
     }
 
-    //ルーティング
-    let route = iproute().radix_tree_search(ipheader.dest_addr);
-    if route == IpRouteEntry::default() {
-        eprintln!("No route to host: {}", print_ip_addr(ipheader.dest_addr));
-        return;
-    }
-
-    //TTL処理
-    if ipheader.ttl <= 1 {
-        //ToDo: ICMP Time Exceeded
-        return;
-    }
-    let mut ipheader2 = ipheader.clone();
-    ipheader2.ttl -= 1;
-    ipheader2.header_checksum = 0;
     ipheader2.header_checksum = u16::from_be_bytes(calc_checksum(&ipheader2.to_packet(true)[..]));
 
     let mut forward_packet = ipheader2.to_packet(true);
-    if inputdev.ipdev.natdev != NatDevice::default() {
-        forward_packet.extend_from_slice(&nat_packet);
-    } else {
-        forward_packet.extend_from_slice(&packet[20..]);
-    }
+    let outbound_payload = translated_payload
+        .as_ref()
+        .map(|p| p.as_slice())
+        .unwrap_or(&packet[20..]);
+    forward_packet.extend_from_slice(outbound_payload);
 
     match route.iptype {
         IpRouteType::Connected => {
@@ -418,7 +517,7 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
             println!(
                 "forward packet is {:x?} : {:x?}",
                 &forward_packet[0..20],
-                nat_packet
+                outbound_payload
             );
             ip_packet_output_to_nexthop(route.nexthop, &forward_packet);
         }
@@ -429,49 +528,59 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
 fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
     for dev in net_device_list().lock().unwrap().iter() {
         if dev.ipdev != IpDevice::default()
-            && dev.ipdev.natdev != NatDevice::default()
+            && dev.ipdev.natdev.is_inside()
             && dev.ipdev.natdev.outside_ip_addr == ipheader.dest_addr
         {
-            let mut nat_exected = false;
-            let mut dest_packet = Vec::new();
-            let res = match ipheader.protocol {
-                IP_PROTOCOL_NUM_UDP => nat_exec (
-                    ipheader,
+            let mut rewritten_header = ipheader.clone();
+            let mut rewritten_payload: Option<Vec<u8>> = None;
+            let res = match rewritten_header.protocol {
+                IP_PROTOCOL_NUM_UDP => nat_exec(
+                    &mut rewritten_header,
                     NatPacketHeader { packet: payload },
-                    &dev.ipdev.natdev.clone(),
+                    &dev.ipdev.natdev,
                     NatProto::Udp,
                     NatDir::Incoming,
                 ),
-                IP_PROTOCOL_NUM_TCP => nat_exec (
-                    ipheader,
+                IP_PROTOCOL_NUM_TCP => nat_exec(
+                    &mut rewritten_header,
                     NatPacketHeader { packet: payload },
-                    &dev.ipdev.natdev.clone(),
+                    &dev.ipdev.natdev,
                     NatProto::Tcp,
                     NatDir::Incoming,
                 ),
                 _ => Ok(Vec::new()),
             };
-            if let Ok(p) = res {
-                if !p.is_empty() {
-                    nat_exected = true;
-                    dest_packet = p;
+            match res {
+                Ok(p) => {
+                    if !p.is_empty() {
+                        rewritten_payload = Some(p);
+                    }
                 }
-            } else {
-                return
+                Err(e) => {
+                    eprintln!("nat packet err: {}", e);
+                    return;
+                }
             }
 
-            if nat_exected {
-                let mut ip_packet = ipheader.to_packet(false);
-                ip_packet.extend_from_slice(&dest_packet);
-                println!(
-                    "To dest is {}, checksum is {:x}, packet is {:x?}",
-                    print_ip_addr(ipheader.dest_addr),
-                    ipheader.header_checksum,
-                    ip_packet
-                );
-                ip_packet_output(dev, iproute().clone(), ipheader.dest_addr, &ip_packet);
-                return;
+            let mut ip_packet = rewritten_header.to_packet(false);
+            if let Some(payload_bytes) = rewritten_payload {
+                ip_packet.extend_from_slice(&payload_bytes);
+            } else {
+                ip_packet.extend_from_slice(payload);
             }
+            println!(
+                "To dest is {}, checksum is {:x}, packet is {:x?}",
+                print_ip_addr(rewritten_header.dest_addr),
+                rewritten_header.header_checksum,
+                ip_packet
+            );
+            ip_packet_output(
+                dev,
+                iproute().clone(),
+                rewritten_header.dest_addr,
+                &ip_packet,
+            );
+            return;
         }
     }
 
@@ -516,7 +625,8 @@ fn ip_packet_output_to_nexthop(next_hop: u32, packet: &[u8]) {
             print_ip_addr(next_hop)
         );
         let route_to_nexthop = iproute().radix_tree_search(next_hop);
-        if route_to_nexthop == IpRouteEntry::default() || route_to_nexthop.iptype != IpRouteType::Connected 
+        if route_to_nexthop == IpRouteEntry::default()
+            || route_to_nexthop.iptype != IpRouteType::Connected
         {
             println!("Next hop {} is not reachable", print_ip_addr(next_hop));
         } else {
@@ -576,6 +686,67 @@ pub fn ip_packet_encapsulate_output(
         arp::queue_pending_packet(inputdev, dest_addr, ETHER_TYPE_IP, &ip_packet);
         send_arp_request(inputdev, dest_addr);
     }
+}
+
+fn send_icmp_destination_unreachable(
+    inputdev: &NetDevice,
+    ipheader: &IpHeader,
+    original_packet: &[u8],
+) {
+    send_icmp_error(
+        inputdev,
+        ipheader,
+        original_packet,
+        icmp::ICMP_TYPE_DESTINATION_UNREACHABLE,
+        1,
+    );
+}
+
+fn send_icmp_time_exceeded(inputdev: &NetDevice, ipheader: &IpHeader, original_packet: &[u8]) {
+    send_icmp_error(
+        inputdev,
+        ipheader,
+        original_packet,
+        icmp::ICMP_TYPE_TIME_EXCEEDED,
+        0,
+    );
+}
+
+fn send_icmp_error(
+    inputdev: &NetDevice,
+    ipheader: &IpHeader,
+    original_packet: &[u8],
+    icmp_type: u8,
+    icmp_code: u8,
+) {
+    if ipheader.src_addr == 0 {
+        return;
+    }
+
+    let header_len_bytes = (ipheader.header_len as usize) * 4;
+    if original_packet.len() < header_len_bytes {
+        return;
+    }
+    let copy_len = (header_len_bytes + 8).min(original_packet.len());
+
+    let mut icmp_packet = Vec::with_capacity(8 + copy_len);
+    icmp_packet.push(icmp_type);
+    icmp_packet.push(icmp_code);
+    icmp_packet.extend_from_slice(&[0, 0]); // checksum placeholder
+    icmp_packet.extend_from_slice(&[0, 0, 0, 0]); // unused field
+    icmp_packet.extend_from_slice(&original_packet[..copy_len]);
+
+    let checksum = calc_checksum(&icmp_packet);
+    icmp_packet[2] = checksum[0];
+    icmp_packet[3] = checksum[1];
+
+    ip_packet_encapsulate_output(
+        inputdev,
+        ipheader.src_addr,
+        inputdev.ipdev.address,
+        &icmp_packet,
+        IP_PROTOCOL_NUM_ICMP,
+    );
 }
 
 //ICMP入力
@@ -645,8 +816,7 @@ mod tests {
         .unwrap();
 
         let table = super::iproute();
-        let lan_route =
-            table.radix_tree_search(u32::from(Ipv4Addr::new(192, 168, 10, 42)));
+        let lan_route = table.radix_tree_search(u32::from(Ipv4Addr::new(192, 168, 10, 42)));
         assert_eq!(lan_route.iptype, IpRouteType::Connected);
         assert_eq!(lan_route.netdev.name, "eth1");
 
