@@ -552,5 +552,6 @@ mod tests {
             lan_dev.ipdev.natdev.outside_ip_addr,
             u32::from(Ipv4Addr::new(203, 0, 113, 2))
         );
+        assert!(lan_dev.ipdev.natdev.shared_state().is_some());
     }
 }

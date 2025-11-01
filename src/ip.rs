@@ -67,7 +67,7 @@ impl NatDevice {
         matches!(self.role, NatInterfaceRole::Inside)
     }
 
-    fn shared_state(&self) -> Option<Arc<Mutex<nat::NatDevice>>> {
+    pub(crate) fn shared_state(&self) -> Option<Arc<Mutex<nat::NatDevice>>> {
         self.state.as_ref().map(Arc::clone)
     }
 }
@@ -382,6 +382,12 @@ pub fn get_ip_device(cidrs: &[&str]) -> IpDevice {
 
 //IP入力処理
 pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
+    println!(
+        "ip_input entry dev={} addr={:08x} len={}",
+        inputdev.name,
+        inputdev.ipdev.address,
+        packet.len()
+    );
     if inputdev.ipdev.address == 0 {
         return;
     }
@@ -468,6 +474,12 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
 
     let mut translated_payload: Option<Vec<u8>> = None;
     if inputdev.ipdev.natdev.is_inside() {
+        println!(
+            "applying NAT on {} toward {} (protocol {})",
+            inputdev.name,
+            print_ip_addr(ipheader2.dest_addr),
+            ipheader2.protocol
+        );
         let res = match ipheader2.protocol {
             IP_PROTOCOL_NUM_UDP => nat_exec(
                 &mut ipheader2,
@@ -573,6 +585,10 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
                 print_ip_addr(rewritten_header.dest_addr),
                 rewritten_header.header_checksum,
                 ip_packet
+            );
+            println!(
+                "incoming NAT delivered to {} (protocol {})",
+                dev.name, rewritten_header.protocol
             );
             ip_packet_output(
                 dev,
@@ -775,6 +791,7 @@ pub fn get_net_devices() -> Result<Vec<NetDevice>, String> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
 
     fn make_device(name: &str) -> NetDevice {
         NetDevice {
@@ -826,5 +843,52 @@ mod tests {
             default_route.nexthop,
             u32::from(Ipv4Addr::new(203, 0, 113, 1))
         );
+    }
+
+    #[test]
+    fn nat_exec_translates_udp_source() {
+        let nat_state = Arc::new(Mutex::new(crate::nat::NatDevice {
+            outside_ip_addr: u32::from(Ipv4Addr::new(203, 0, 113, 2)),
+            ..Default::default()
+        }));
+
+        let nat_dev = NatDevice::for_inside(u32::from(Ipv4Addr::new(203, 0, 113, 2)), nat_state);
+        let mut ip_header = IpHeader {
+            version: 4,
+            header_len: 5,
+            tos: 0,
+            total_len: 28,
+            identify: 0,
+            frag_offset: 0,
+            ttl: 64,
+            protocol: IP_PROTOCOL_NUM_UDP,
+            header_checksum: 0,
+            src_addr: u32::from(Ipv4Addr::new(192, 168, 10, 10)),
+            dest_addr: u32::from(Ipv4Addr::new(203, 0, 113, 1)),
+        };
+
+        let udp_payload = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&40001u16.to_be_bytes()); // src port
+            buf.extend_from_slice(&8080u16.to_be_bytes()); // dest port
+            buf.extend_from_slice(&12u16.to_be_bytes()); // length
+            buf.extend_from_slice(&0u16.to_be_bytes()); // checksum placeholder
+            buf.extend_from_slice(b"hello test");
+            buf
+        };
+
+        let translated = nat_exec(
+            &mut ip_header,
+            NatPacketHeader {
+                packet: &udp_payload,
+            },
+            &nat_dev,
+            NatProto::Udp,
+            NatDir::Outgoing,
+        )
+        .expect("nat exec");
+
+        assert_eq!(ip_header.src_addr, u32::from(Ipv4Addr::new(203, 0, 113, 2)));
+        assert_ne!(u16::from_be_bytes([translated[0], translated[1]]), 40001u16);
     }
 }
