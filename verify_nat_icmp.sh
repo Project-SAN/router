@@ -82,7 +82,7 @@ echo "    router PID: $ROUTER_PID"
 
 echo "[*] starting upstream tcpdump and UDP listener..."
 sudo ip netns exec upstream bash -lc "rm -f /tmp/upstream_udp.log /tmp/upstream_server.log"
-sudo ip netns exec upstream bash -lc "tcpdump -nn -l -i veth-wan udp > /tmp/upstream_udp.log 2>&1 & echo \$! > /tmp/tcpdump.pid"
+sudo ip netns exec upstream bash -lc "stdbuf -oL -eL tcpdump -nn -l -i veth-wan udp > /tmp/upstream_udp.log 2>&1 & echo \$! > /tmp/tcpdump.pid"
 TCPDUMP_PID="$(sudo ip netns exec upstream cat /tmp/tcpdump.pid)"
 sudo ip netns exec upstream bash -lc "nc -u -l -p 8080 > /tmp/upstream_server.log 2>&1 & echo \$! > /tmp/udpserver.pid"
 UDP_SERVER_PID="$(sudo ip netns exec upstream cat /tmp/udpserver.pid)"

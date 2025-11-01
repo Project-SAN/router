@@ -262,10 +262,21 @@ impl RawSocketDevice {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RawSocketHandle {
+    socket: RawFd,
+    sockaddr: libc::sockaddr_ll,
+}
+
 static RUNTIME_DEVICES: OnceLock<Mutex<Vec<RawSocketDevice>>> = OnceLock::new();
+static SEND_HANDLES: OnceLock<Mutex<HashMap<String, RawSocketHandle>>> = OnceLock::new();
 
 fn device_store() -> &'static Mutex<Vec<RawSocketDevice>> {
     RUNTIME_DEVICES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn send_handle_store() -> &'static Mutex<HashMap<String, RawSocketHandle>> {
+    SEND_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn initialise_raw_devices(
@@ -365,6 +376,28 @@ fn register_runtime_devices(devices: Vec<RawSocketDevice>) -> Result<(), InitErr
         .lock()
         .map_err(|_| InitError::DeviceRegistry("runtime device store is poisoned".to_string()))?;
     *guard = devices;
+    for dev in guard.iter() {
+        println!(
+            "registered runtime device: {} (fd={})",
+            dev.name(),
+            dev.socket
+        );
+    }
+
+    let send_store = send_handle_store();
+    let mut send_guard = send_store
+        .lock()
+        .map_err(|_| InitError::DeviceRegistry("send handle store is poisoned".to_string()))?;
+    send_guard.clear();
+    for dev in guard.iter() {
+        send_guard.insert(
+            dev.name().to_string(),
+            RawSocketHandle {
+                socket: dev.socket,
+                sockaddr: dev.sockaddr,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -390,16 +423,23 @@ pub fn has_runtime_devices() -> bool {
 }
 
 pub fn transmit_frame(interface: &str, dest_mac: [u8; 6], frame: &[u8]) -> Result<(), String> {
-    let guard = device_store()
+    let handles = send_handle_store()
         .lock()
-        .map_err(|_| "runtime device store is poisoned".to_string())?;
-
-    let dev = guard
-        .iter()
-        .find(|d| d.socket >= 0 && d.name() == interface)
+        .map_err(|_| "send handle store is poisoned".to_string())?;
+    let handle = handles
+        .get(interface)
+        .copied()
         .ok_or_else(|| format!("interface `{}` is not initialised", interface))?;
+    drop(handles);
 
-    let mut sockaddr = dev.sockaddr;
+    println!(
+        "transmit_frame on {} -> {:02x?} ({} bytes)",
+        interface,
+        dest_mac,
+        frame.len()
+    );
+
+    let mut sockaddr = handle.sockaddr;
     for (idx, byte) in dest_mac.iter().enumerate() {
         if idx < sockaddr.sll_addr.len() {
             sockaddr.sll_addr[idx] = *byte;
@@ -408,7 +448,7 @@ pub fn transmit_frame(interface: &str, dest_mac: [u8; 6], frame: &[u8]) -> Resul
 
     let ret = unsafe {
         libc::sendto(
-            dev.socket,
+            handle.socket,
             frame.as_ptr() as *const libc::c_void,
             frame.len(),
             0,

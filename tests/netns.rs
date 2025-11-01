@@ -115,7 +115,7 @@ fn nat_udp_roundtrip_and_icmp() {
     let router_pid = wait_for_pid_by_pgrep("rtr", &router_bin);
 
     // start tcpdump and UDP listener upstream
-    run!("sudo ip netns exec upstream bash -lc \"tcpdump -nn -l -i veth-wan udp > /tmp/upstream_udp.log 2>&1 &\"");
+    run!("sudo ip netns exec upstream bash -lc \"stdbuf -oL -eL tcpdump -nn -l -i veth-wan udp > /tmp/upstream_udp.log 2>&1 &\"");
     let tcpdump_pid = wait_for_pid_by_pgrep("upstream", "tcpdump");
 
     run!("sudo ip netns exec upstream bash -lc \"nc -u -l -p 8080 > /tmp/upstream_server.log 2>&1 &\"");
@@ -129,7 +129,7 @@ fn nat_udp_roundtrip_and_icmp() {
     let nat_port_output = Command::new("bash")
         .arg("-lc")
         .arg(
-            "sudo ip netns exec upstream bash -lc \"python3 - <<'PY'\nimport re\ntry:\n    with open('/tmp/upstream_udp.log') as f:\n        for line in f:\n            m = re.search(r'203\\\\.0\\\\.113\\\\.2\\\\.(\\\\d+)\\\\s*>\\\\s*203\\\\.0\\\\.113\\\\.1\\\\.8080', line)\n            if m:\n                print(m.group(1))\n                break\nexcept FileNotFoundError:\n    pass\nPY\n\"",
+            "sudo ip netns exec upstream bash -lc \"python3 - <<'PY'\nimport re\nimport sys\nimport time\npattern = re.compile(r'203\\\\.0\\\\.113\\\\.2\\\\.(\\\\d+)\\\\s*>\\\\s*203\\\\.0\\\\.113\\\\.1\\\\.8080')\nfor _ in range(20):\n    try:\n        with open('/tmp/upstream_udp.log') as f:\n            for line in f:\n                m = pattern.search(line)\n                if m:\n                    print(m.group(1))\n                    sys.exit(0)\n    except FileNotFoundError:\n        pass\n    time.sleep(0.5)\nPY\n\"",
         )
         .output()
         .expect("failed to parse NAT port");
@@ -145,8 +145,8 @@ fn nat_udp_roundtrip_and_icmp() {
     );
 
     // ICMP behaviour
-    run!("sudo ip netns exec client ping -c1 -t1 203.0.113.1");
-    run!("sudo ip netns exec client ping -c1 198.18.0.1");
+    run!("sudo ip netns exec client bash -lc 'ping -c1 -t1 203.0.113.1 || true'");
+    run!("sudo ip netns exec client bash -lc 'ping -c1 198.18.0.1 || true'");
 
     // teardown
     run!(

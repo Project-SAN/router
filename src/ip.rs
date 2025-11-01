@@ -531,7 +531,7 @@ pub fn ip_input(inputdev: &NetDevice, packet: &[u8]) {
                 &forward_packet[0..20],
                 outbound_payload
             );
-            ip_packet_output_to_nexthop(route.nexthop, &forward_packet);
+            ip_packet_output_to_nexthop(&route.netdev, route.nexthop, &forward_packet);
         }
     }
 }
@@ -590,12 +590,7 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
                 "incoming NAT delivered to {} (protocol {})",
                 dev.name, rewritten_header.protocol
             );
-            ip_packet_output(
-                dev,
-                iproute().clone(),
-                rewritten_header.dest_addr,
-                &ip_packet,
-            );
+            ip_packet_output(iproute().clone(), rewritten_header.dest_addr, &ip_packet);
             return;
         }
     }
@@ -633,28 +628,23 @@ fn ip_packet_output_to_host(dev: &NetDevice, dest_addr: u32, packet: &[u8]) {
     }
 }
 
-fn ip_packet_output_to_nexthop(next_hop: u32, packet: &[u8]) {
+fn ip_packet_output_to_nexthop(netdev: &NetDevice, next_hop: u32, packet: &[u8]) {
     let (dest_mac, dev) = search_arp_table_entry(next_hop);
     if dest_mac == [0u8; 6] {
         println!(
             "Trying ip output to nexthop, but no arp recoed to {}",
             print_ip_addr(next_hop)
         );
-        let route_to_nexthop = iproute().radix_tree_search(next_hop);
-        if route_to_nexthop == IpRouteEntry::default()
-            || route_to_nexthop.iptype != IpRouteType::Connected
-        {
-            println!("Next hop {} is not reachable", print_ip_addr(next_hop));
-        } else {
-            arp::queue_pending_packet(&route_to_nexthop.netdev, next_hop, ETHER_TYPE_IP, packet);
-            send_arp_request(&route_to_nexthop.netdev, next_hop);
-        }
+        arp::queue_pending_packet(netdev, next_hop, ETHER_TYPE_IP, packet);
+        send_arp_request(netdev, next_hop);
     } else if let Some(dev) = dev {
         ethernet_output(&dev, dest_mac, packet, ETHER_TYPE_IP);
+    } else {
+        ethernet_output(netdev, dest_mac, packet, ETHER_TYPE_IP);
     }
 }
 
-fn ip_packet_output(outputdev: &NetDevice, route_tree: RouteTable, dest_addr: u32, packet: &[u8]) {
+fn ip_packet_output(route_tree: RouteTable, dest_addr: u32, packet: &[u8]) {
     let route = route_tree.radix_tree_search(dest_addr);
     if route == IpRouteEntry::default() {
         println!("No route to {}", print_ip_addr(dest_addr));
@@ -662,10 +652,10 @@ fn ip_packet_output(outputdev: &NetDevice, route_tree: RouteTable, dest_addr: u3
     }
     match route.iptype {
         IpRouteType::Connected => {
-            ip_packet_output_to_host(outputdev, dest_addr, packet);
+            ip_packet_output_to_host(&route.netdev, dest_addr, packet);
         }
         IpRouteType::Network => {
-            ip_packet_output_to_nexthop(dest_addr, packet);
+            ip_packet_output_to_nexthop(&route.netdev, route.nexthop, packet);
         }
     }
 }

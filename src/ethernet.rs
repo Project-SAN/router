@@ -67,6 +67,13 @@ pub fn ethernet_output(
     payload: &[u8],
     eth_type: u16,
 ) -> Result<(), String> {
+    println!(
+        "ethernet_output via {} -> {:02x?} type {:04x} len {}",
+        netdev.name,
+        destaddr,
+        eth_type,
+        payload.len()
+    );
     let mut frame = EthernetHeader {
         dest_addr: destaddr,
         src_addr: netdev.macaddr,
@@ -80,5 +87,12 @@ pub fn ethernet_output(
         frame.resize(60, 0);
     }
 
-    runtime::transmit_frame(&netdev.name, destaddr, &frame)
+    let result = runtime::transmit_frame(&netdev.name, destaddr, &frame);
+    if let Err(err) = &result {
+        eprintln!(
+            "ethernet_output failed on {} -> {:02x?}: {}",
+            netdev.name, destaddr, err
+        );
+    }
+    result
 }
