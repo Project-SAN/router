@@ -1,3 +1,6 @@
+use crate::ethernet::ethernet_output;
+use crate::ip::NetDevice;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};
 
@@ -16,18 +19,6 @@ pub const ETHERNET_ADDRESS_BROADCAST: [u8; 6] = [0xff; 6];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MacAddr(pub [u8; 6]);
 
-#[derive(Clone, Debug)]
-pub struct IpDev {
-    pub address: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct NetDevice {
-    pub name: String,
-    pub macddr: [u8; 6],
-    pub ipdev: IpDev,
-}
-
 //ARPテーブル(global)
 #[derive(Clone, Debug)]
 pub struct ArpTableEntry {
@@ -40,6 +31,34 @@ static ARP_TABLE: OnceLock<Mutex<Vec<ArpTableEntry>>> = OnceLock::new();
 
 fn arp_table() -> &'static Mutex<Vec<ArpTableEntry>> {
     ARP_TABLE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[derive(Clone, Debug)]
+struct PendingPacket {
+    interface: String,
+    ethertype: u16,
+    payload: Vec<u8>,
+}
+
+static PENDING_QUEUE: OnceLock<Mutex<HashMap<u32, Vec<PendingPacket>>>> = OnceLock::new();
+
+fn pending_packets() -> &'static Mutex<HashMap<u32, Vec<PendingPacket>>> {
+    PENDING_QUEUE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const MAX_PENDING_PER_IP: usize = 32;
+
+pub fn queue_pending_packet(netdev: &NetDevice, target_ip: u32, ethertype: u16, payload: &[u8]) {
+    let mut queue = pending_packets().lock().unwrap();
+    let entry = queue.entry(target_ip).or_insert_with(Vec::new);
+    if entry.len() >= MAX_PENDING_PER_IP {
+        entry.remove(0);
+    }
+    entry.push(PendingPacket {
+        interface: netdev.name.clone(),
+        ethertype,
+        payload: payload.to_vec(),
+    });
 }
 
 //ARPメッセージ(Ethernet/IP向け)
@@ -57,8 +76,12 @@ pub struct ArpIPToEthernet {
 }
 
 //バイト変換ヘルパ
-fn u16_to_be_bytes(x: u16) -> [u8; 2] { x.to_be_bytes() }
-fn u32_to_be_bytes(x: u32) -> [u8; 4] { x.to_be_bytes() }
+fn u16_to_be_bytes(x: u16) -> [u8; 2] {
+    x.to_be_bytes()
+}
+fn u32_to_be_bytes(x: u32) -> [u8; 4] {
+    x.to_be_bytes()
+}
 fn be_bytes_to_u16(bytes: &[u8]) -> u16 {
     let mut arr = [0u8; 2];
     arr.copy_from_slice(&bytes[0..2]);
@@ -84,7 +107,7 @@ fn print_ip_addr(ip: u32) -> String {
 
 fn print_mac_addr(mac: [u8; 6]) -> String {
     let mut s = String::new();
-    for(i, b) in mac.iter().enumerate() {
+    for (i, b) in mac.iter().enumerate() {
         let _ = write!(&mut s, "{:02x}{}", b, if i < 5 { ":" } else { "" });
     }
     s
@@ -128,27 +151,29 @@ impl ArpIPToEthernet {
 
 pub fn add_arp_table_entry(netdev: &NetDevice, ipaddr: u32, macaddr: [u8; 6]) {
     let mut table = arp_table().lock().unwrap();
+    let mut updated = false;
 
     for entry in table.iter_mut() {
-        //ipアドレスが同じだがらMACアドレスが異なる=>更新
-        if entry.ip_addr == ipaddr && entry.mac_addr != macaddr {
-            entry.mac_addr = macaddr;
-        }
-        //macは同じだがらipが異なる=>更新
-        if entry.mac_addr == macaddr && entry.ip_addr != ipaddr {
-            entry.ip_addr = ipaddr;
-        }
-        //すでに存在
-        if entry.ip_addr == ipaddr && entry.mac_addr == macaddr {
-            return;
+        if entry.ip_addr == ipaddr {
+            if entry.mac_addr != macaddr {
+                entry.mac_addr = macaddr;
+            }
+            entry.netdev = netdev.clone();
+            updated = true;
+            break;
         }
     }
 
-    table.push(ArpTableEntry {
-        mac_addr: macaddr,
-        ip_addr: ipaddr,
-        netdev: netdev.clone(),
-    })
+    if !updated {
+        table.push(ArpTableEntry {
+            mac_addr: macaddr,
+            ip_addr: ipaddr,
+            netdev: netdev.clone(),
+        });
+    }
+
+    drop(table);
+    flush_pending_packets(ipaddr, macaddr);
 }
 
 pub fn search_arp_table_entry(ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
@@ -159,6 +184,49 @@ pub fn search_arp_table_entry(ipaddr: u32) -> ([u8; 6], Option<NetDevice>) {
         }
     }
     ([0u8; 6], None)
+}
+
+pub fn snapshot_arp_table() -> Vec<ArpTableEntry> {
+    let table = arp_table().lock().unwrap();
+    table.clone()
+}
+
+fn flush_pending_packets(ipaddr: u32, macaddr: [u8; 6]) {
+    let packets = {
+        let mut queue = pending_packets().lock().unwrap();
+        queue.remove(&ipaddr)
+    };
+
+    let Some(packets) = packets else {
+        return;
+    };
+
+    let Ok(devices) = crate::ip::get_net_devices() else {
+        let mut queue = pending_packets().lock().unwrap();
+        queue.insert(ipaddr, packets);
+        return;
+    };
+
+    let mut unsent: Vec<PendingPacket> = Vec::new();
+
+    for packet in packets {
+        if let Some(dev) = devices.iter().find(|d| d.name == packet.interface) {
+            if let Err(err) = ethernet_output(dev, macaddr, &packet.payload, packet.ethertype) {
+                eprintln!("failed to flush pending packet on {}: {}", dev.name, err);
+                unsent.push(packet);
+            }
+        } else {
+            eprintln!(
+                "dropping pending packet: interface {} not found",
+                packet.interface
+            );
+        }
+    }
+
+    if !unsent.is_empty() {
+        let mut queue = pending_packets().lock().unwrap();
+        queue.entry(ipaddr).or_default().extend(unsent);
+    }
 }
 
 //arp受信処理
@@ -192,12 +260,14 @@ pub fn arp_input(netdev: &NetDevice, packet: &[u8]) {
                 arp_reply_arrives(netdev, &arp_msg);
             }
         }
-        _ => {/*他のプロトコルは無視*/}
+        _ => { /*他のプロトコルは無視*/ }
     }
 }
 
 //ARPリクエスト/リプライ処理
-pub fn arp_request_arrives(netdev: &NetDevice, arp: &ArpIPToEthernet){
+pub fn arp_request_arrives(netdev: &NetDevice, arp: &ArpIPToEthernet) {
+    add_arp_table_entry(netdev, arp.sender_ip_addr, arp.sender_hardware_addr);
+
     if netdev.ipdev.address != 0 && netdev.ipdev.address == arp.target_ip_addr {
         println!(
             "Sendeing arp reply to {}",
@@ -210,14 +280,17 @@ pub fn arp_request_arrives(netdev: &NetDevice, arp: &ArpIPToEthernet){
             hardware_len: ETHERNET_ADDRESS_LEN,
             protocol_len: IP_ADDRESS_LEN,
             opcode: ARP_OPERATION_CODE_REPLY,
-            sender_hardware_addr: netdev.macddr,
+            sender_hardware_addr: netdev.macaddr,
             sender_ip_addr: netdev.ipdev.address,
             target_hardware_addr: arp.sender_hardware_addr,
             target_ip_addr: arp.sender_ip_addr,
         }
         .to_packet();
 
-        ethernet_output(netdev, arp.sender_hardware_addr, &reply, ETHER_TYPE_ARP);
+        if let Err(err) = ethernet_output(netdev, arp.sender_hardware_addr, &reply, ETHER_TYPE_ARP)
+        {
+            eprintln!("failed to send arp reply on {}: {}", netdev.name, err);
+        }
     }
 }
 
@@ -244,22 +317,14 @@ pub fn send_arp_request(netdev: &NetDevice, target_ip: u32) {
         hardware_len: ETHERNET_ADDRESS_LEN,
         protocol_len: IP_ADDRESS_LEN,
         opcode: ARP_OPERATION_CODE_REQUEST,
-        sender_hardware_addr: netdev.macddr,
+        sender_hardware_addr: netdev.macaddr,
         sender_ip_addr: netdev.ipdev.address,
         target_hardware_addr: ETHERNET_ADDRESS_BROADCAST,
         target_ip_addr: target_ip,
     }
     .to_packet();
 
-    ethernet_output(
-        netdev,
-        ETHERNET_ADDRESS_BROADCAST,
-        &req,
-        ETHER_TYPE_ARP,
-    );
-}
-
-//送信
-fn ethernet_output(_netdev: &NetDevice, _dst_mac: [u8; 6], _payload: &[u8], ethertype: u16) {
-    
+    if let Err(err) = ethernet_output(netdev, ETHERNET_ADDRESS_BROADCAST, &req, ETHER_TYPE_ARP) {
+        eprintln!("failed to send arp request on {}: {}", netdev.name, err);
+    }
 }
