@@ -263,16 +263,25 @@ impl HornetRuntime {
             .circuits
             .get(&key)
             .and_then(|state| state.route_override.clone());
+        let enforce_policy = route_override.is_none();
         let mut forwarder = RouterForward::new(self.listen_port, route_override);
         let mut node_ctx = crate::hornet::node::NodeCtx {
             sv: self.sv,
             now: &clock,
             forward: &mut forwarder,
             replay: &mut self.replay,
-            policy: Some(&mut self.registry),
+            policy: None,
         };
-        crate::hornet::node::forward::process_data(&mut node_ctx, chdr, ahdr, payload)
-            .map_err(ProcessError::Hornet)?;
+        if let Err(err) =
+            crate::hornet::node::forward::process_data(&mut node_ctx, chdr, ahdr, payload)
+        {
+            return Err(ProcessError::Hornet(err));
+        }
+        if enforce_policy {
+            self.registry
+                .enforce(payload)
+                .map_err(ProcessError::Hornet)?;
+        }
         match forwarder.into_packet()? {
             Some(packet) => Ok(ProcessOutcome::Forward(packet)),
             None => Ok(ProcessOutcome::Consumed),
@@ -324,6 +333,16 @@ impl HornetRuntime {
             .iter()
             .find_map(|id| self.policy_routes.get(id))
             .cloned();
+        let should_forward = setup_pkt.shdr.stage < setup_pkt.shdr.hops
+            || route_override
+                .as_ref()
+                .and_then(|r| r.interface.as_ref())
+                .is_some();
+        let circuit_route_override = if should_forward {
+            route_override.clone()
+        } else {
+            None
+        };
 
         self.circuits
             .entry(key)
@@ -336,30 +355,32 @@ impl HornetRuntime {
                     }
                 }
                 state.forward_keys.push(si);
-                state.route_override = route_override.clone();
+                state.route_override = circuit_route_override.clone();
             })
             .or_insert_with(|| CircuitState {
                 last_setup: now,
                 exp,
                 policies: registered_ids.clone(),
                 forward_keys: vec![si],
-                route_override: route_override.clone(),
+                route_override: circuit_route_override.clone(),
             });
 
-        let mut forward_payload = encode_setup_payload(&setup_pkt)?;
-        let chosen_segment = route_override
-            .as_ref()
-            .map(|r| r.segment.clone())
-            .unwrap_or_else(|| ahdr_res.r.clone());
-        let mut forwarder = RouterForward::new(self.listen_port, route_override);
-        forwarder
-            .send(
-                &chosen_segment,
-                &setup_pkt.chdr,
-                &ahdr_res.ahdr_next,
-                &mut forward_payload,
-            )
-            .map_err(ProcessError::Hornet)?;
+        let mut forwarder = RouterForward::new(self.listen_port, circuit_route_override.clone());
+        if should_forward {
+            let mut forward_payload = encode_setup_payload(&setup_pkt)?;
+            let chosen_segment = circuit_route_override
+                .as_ref()
+                .map(|r| r.segment.clone())
+                .unwrap_or_else(|| ahdr_res.r.clone());
+            forwarder
+                .send(
+                    &chosen_segment,
+                    &setup_pkt.chdr,
+                    &ahdr_res.ahdr_next,
+                    &mut forward_payload,
+                )
+                .map_err(ProcessError::Hornet)?;
+        }
         match forwarder.into_packet()? {
             Some(packet) => Ok(ProcessOutcome::Forward(packet)),
             None => Ok(ProcessOutcome::Consumed),
@@ -482,6 +503,7 @@ pub fn decode_setup_payload(chdr: &Chdr, body: &[u8]) -> Result<setup::SetupPack
         return Err(ProcessError::Malformed("setup payload truncated"));
     }
     let payload_bytes = body[idx..idx + payload_len].to_vec();
+    idx += payload_len;
 
     if payload_len != rmax.saturating_mul(types::C_BLOCK) {
         return Err(ProcessError::Malformed("setup payload length mismatch"));
@@ -507,14 +529,15 @@ pub fn decode_setup_payload(chdr: &Chdr, body: &[u8]) -> Result<setup::SetupPack
         idx += 2;
         for _ in 0..tlv_count {
             if idx + 2 > body.len() {
-                break;
+                return Err(ProcessError::Malformed("setup tlv length missing"));
             }
             let tlv_len = read_be_u16(&body[idx..idx + 2]) as usize;
             idx += 2;
-            let avail = body.len().saturating_sub(idx);
-            let take = core::cmp::min(tlv_len, avail);
-            tlvs.push(body[idx..idx + take].to_vec());
-            idx += take;
+            if idx + tlv_len > body.len() {
+                return Err(ProcessError::Malformed("setup tlv truncated"));
+            }
+            tlvs.push(body[idx..idx + tlv_len].to_vec());
+            idx += tlv_len;
         }
     }
 
@@ -621,7 +644,18 @@ impl Forward for RouterForward {
             .as_ref()
             .map(|route| route.segment.clone())
             .unwrap_or_else(|| rseg.clone());
-        let elems = routing::elems_from_segment(&selected_segment)?;
+        if selected_segment.0.is_empty() {
+            self.packet = Ok(None);
+            return Ok(());
+        }
+        let elems = match routing::elems_from_segment(&selected_segment) {
+            Ok(elems) => elems,
+            Err(types::Error::Length) if self.override_route.is_none() => {
+                self.packet = Ok(None);
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         let next = elems
             .iter()
             .find_map(|elem| match elem {
@@ -764,7 +798,7 @@ mod tests {
         let mut rng = XorShift64(0x1234_5678_90ab_cdef);
         let nodes = vec![gen_node(&mut rng, 0x9000)];
         let pubs: Vec<[u8; 32]> = nodes.iter().map(|n| n.1).collect();
-        let exp = Exp(1_234_000);
+        let exp = Exp(4_000_000_000u32);
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         seed[0] &= 248;
@@ -780,17 +814,9 @@ mod tests {
             verifier_blob: vec![0xAA, 0xBB],
         };
         state.attach_policy_metadata(&meta);
-        dbg!(state.packet.tlvs.iter().map(|tlv| tlv.len()).collect::<Vec<_>>());
-        dbg!(state.packet.shdr.beta.len());
-        dbg!(state.packet.payload.bytes.len());
         assert_eq!(state.packet.tlvs.len(), 1);
 
         let encoded = encode_setup_payload(&state.packet).expect("encode");
-        dbg!(encoded.len());
-        println!(
-            "tail bytes: {:?}",
-            &encoded[encoded.len().saturating_sub(64)..]
-        );
         let decoded = decode_setup_payload(&state.packet.chdr, &encoded).expect("decode");
         assert_eq!(decoded.shdr.rmax, state.packet.shdr.rmax);
         assert_eq!(decoded.shdr.stage, state.packet.shdr.stage);
@@ -803,7 +829,7 @@ mod tests {
         let mut rng = XorShift64(0x2222_aaaa_3333_bbbb);
         let node = gen_node(&mut rng, 0x7000);
         let pubs = vec![node.1];
-        let exp = Exp(2_345_678);
+        let exp = Exp(4_000_000_100u32);
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         seed[0] &= 248;
@@ -876,7 +902,7 @@ mod tests {
         let mut rng = XorShift64(0x5151_a1a1_b2b2_c3c3);
         let nodes = vec![gen_node(&mut rng, 0x1000), gen_node(&mut rng, 0x2000)];
         let pubs: Vec<[u8; 32]> = nodes.iter().map(|n| n.1).collect();
-        let exp = Exp(4_200_000);
+        let exp = Exp(4_000_000_200u32);
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         seed[0] &= 248;
