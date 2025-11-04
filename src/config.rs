@@ -1,6 +1,7 @@
+use crate::hornet::{routing, types as hornet_types};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -55,6 +56,26 @@ pub struct HornetConfig {
     pub directory_file: Option<PathBuf>,
     pub directory_secret_hex: Option<String>,
     pub policy_cache_ttl: u64,
+    #[serde(skip_serializing)]
+    pub policy_routes: Vec<HornetPolicyRoute>,
+}
+
+#[derive(Clone)]
+pub struct HornetPolicyRoute {
+    pub policy_id: [u8; 32],
+    pub segment: hornet_types::RoutingSegment,
+    pub interface: Option<String>,
+}
+
+impl fmt::Debug for HornetPolicyRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let segment_len = self.segment.0.len();
+        f.debug_struct("HornetPolicyRoute")
+            .field("policy_id", &hex_encode_bytes(&self.policy_id))
+            .field("segment_len", &segment_len)
+            .field("interface", &self.interface)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -261,6 +282,12 @@ impl HornetConfig {
             ));
         }
 
+        let policy_routes = raw
+            .policy_routes
+            .into_iter()
+            .map(HornetPolicyRoute::from_raw)
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(HornetConfig {
             enabled: raw.enabled,
             listen_addr,
@@ -270,6 +297,7 @@ impl HornetConfig {
             directory_file,
             directory_secret_hex,
             policy_cache_ttl,
+            policy_routes,
         })
     }
 }
@@ -293,6 +321,12 @@ fn parse_ipv4_addr(input: &str) -> Result<Ipv4Addr, ConfigError> {
     input
         .parse::<Ipv4Addr>()
         .map_err(|e| ConfigError::InvalidValue(format!("invalid IPv4 address `{}`: {}", input, e)))
+}
+
+fn parse_ipv6_addr(input: &str) -> Result<Ipv6Addr, ConfigError> {
+    input
+        .parse::<Ipv6Addr>()
+        .map_err(|e| ConfigError::InvalidValue(format!("invalid IPv6 address `{}`: {}", input, e)))
 }
 
 fn parse_ipv4_network(input: &str) -> Result<Ipv4Network, ConfigError> {
@@ -370,6 +404,41 @@ fn normalize_hex_with_len(input: &str, expected_bytes: usize) -> Result<String, 
     Ok(normalized)
 }
 
+fn hex_to_bytes(input: &str) -> Result<Vec<u8>, ConfigError> {
+    let normalized = normalize_hex(input)?;
+    let mut bytes = Vec::with_capacity(normalized.len() / 2);
+    let mut chars = normalized.as_bytes().chunks_exact(2);
+    for chunk in &mut chars {
+        let hi = chunk[0];
+        let lo = chunk[1];
+        let value = (hex_digit(hi)? << 4) | hex_digit(lo)?;
+        bytes.push(value);
+    }
+    Ok(bytes)
+}
+
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(TABLE[(b >> 4) as usize] as char);
+        out.push(TABLE[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_digit(b: u8) -> Result<u8, ConfigError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(ConfigError::InvalidValue(format!(
+            "invalid hex character `{}`",
+            b as char
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct RawRouterConfig {
     #[serde(default)]
@@ -444,6 +513,108 @@ struct RawHornetConfig {
     directory_secret: Option<String>,
     #[serde(default)]
     policy_cache_ttl: Option<u64>,
+    #[serde(default)]
+    policy_routes: Vec<RawHornetPolicyRoute>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawHornetPolicyRoute {
+    policy_id: String,
+    #[serde(default)]
+    interface: Option<String>,
+    #[serde(default)]
+    segments: Vec<RawRouteElem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RawRouteElem {
+    NextHop4 {
+        ip: String,
+        port: u16,
+    },
+    NextHop6 {
+        ip: String,
+        port: u16,
+    },
+    ExitTcp4 {
+        ip: String,
+        port: u16,
+        #[serde(default)]
+        tls: bool,
+    },
+    ExitTcp6 {
+        ip: String,
+        port: u16,
+        #[serde(default)]
+        tls: bool,
+    },
+}
+
+impl HornetPolicyRoute {
+    fn from_raw(raw: RawHornetPolicyRoute) -> Result<Self, ConfigError> {
+        let policy_bytes = hex_to_bytes(&raw.policy_id)?;
+        if policy_bytes.len() != 32 {
+            return Err(ConfigError::InvalidValue(format!(
+                "hornet.policy_routes policy_id must encode 32 bytes: {}",
+                raw.policy_id
+            )));
+        }
+        let mut policy_id = [0u8; 32];
+        policy_id.copy_from_slice(&policy_bytes);
+        let elems = raw
+            .segments
+            .into_iter()
+            .map(|spec| spec.to_route_elem())
+            .collect::<Result<Vec<_>, _>>()?;
+        if elems.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "hornet.policy_routes entry must contain at least one segment".into(),
+            ));
+        }
+        Ok(HornetPolicyRoute {
+            policy_id,
+            segment: routing::segment_from_elems(&elems),
+            interface: raw.interface,
+        })
+    }
+}
+
+impl RawRouteElem {
+    fn to_route_elem(self) -> Result<routing::RouteElem, ConfigError> {
+        match self {
+            RawRouteElem::NextHop4 { ip, port } => {
+                let addr = parse_ipv4_addr(&ip)?;
+                Ok(routing::RouteElem::NextHop {
+                    addr: routing::IpAddr::V4(addr.octets()),
+                    port,
+                })
+            }
+            RawRouteElem::NextHop6 { ip, port } => {
+                let addr = parse_ipv6_addr(&ip)?;
+                Ok(routing::RouteElem::NextHop {
+                    addr: routing::IpAddr::V6(addr.octets()),
+                    port,
+                })
+            }
+            RawRouteElem::ExitTcp4 { ip, port, tls } => {
+                let addr = parse_ipv4_addr(&ip)?;
+                Ok(routing::RouteElem::ExitTcp {
+                    addr: routing::IpAddr::V4(addr.octets()),
+                    port,
+                    tls,
+                })
+            }
+            RawRouteElem::ExitTcp6 { ip, port, tls } => {
+                let addr = parse_ipv6_addr(&ip)?;
+                Ok(routing::RouteElem::ExitTcp {
+                    addr: routing::IpAddr::V6(addr.octets()),
+                    port,
+                    tls,
+                })
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {

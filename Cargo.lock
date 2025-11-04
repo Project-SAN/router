@@ -838,7 +838,6 @@ dependencies = [
 [[package]]
 name = "hornet"
 version = "0.1.0"
-source = "git+https://github.com/Project-SAN/HORNET#1a76deff7de6f2bf48bfaf3b306e250b19a70455"
 dependencies = [
  "actix-web",
  "aes",
@@ -1420,10 +1419,12 @@ dependencies = [
  "clap",
  "hornet",
  "libc",
- "rand_core 0.9.3",
+ "rand_core 0.6.4",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
+ "x25519-dalek",
 ]
 
 [[package]]

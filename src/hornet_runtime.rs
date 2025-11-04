@@ -3,7 +3,7 @@ use crate::hornet::time::TimeProvider;
 use crate::hornet::{
     forward::Forward,
     node::ReplayCache,
-    policy::{self, PolicyMetadata, PolicyRegistry},
+    policy::{self, PolicyId, PolicyMetadata, PolicyRegistry},
     routing::{self, RouteElem},
     setup,
     setup::directory,
@@ -86,6 +86,7 @@ pub struct ForwardPacket {
     pub next_port: u16,
     pub source_port: u16,
     pub wire_payload: Vec<u8>,
+    pub interface: Option<String>,
 }
 
 pub struct HornetRuntime {
@@ -98,6 +99,7 @@ pub struct HornetRuntime {
     registry: PolicyRegistry,
     last_directory_refresh: Option<SystemTime>,
     circuits: HashMap<CircuitKey, CircuitState>,
+    policy_routes: HashMap<PolicyId, RouteOverride>,
 }
 
 impl HornetRuntime {
@@ -157,13 +159,17 @@ impl HornetRuntime {
             registry: PolicyRegistry::new(),
             last_directory_refresh: None,
             circuits: HashMap::new(),
+            policy_routes: HashMap::new(),
         };
         runtime.reload_directory()?;
+        runtime.apply_static_policy_routes();
         Ok(runtime)
     }
 
     fn reload_directory(&mut self) -> Result<(), InitError> {
+        self.policy_routes.clear();
         let Some(path) = self.config.directory_file.as_deref() else {
+            self.apply_static_policy_routes();
             return Ok(());
         };
 
@@ -179,8 +185,34 @@ impl HornetRuntime {
         for meta in announcement.policies() {
             self.registry.register(meta.clone())?;
         }
+        self.apply_directory_routes(announcement.routes());
         self.last_directory_refresh = Some(SystemTime::now());
+        self.apply_static_policy_routes();
         Ok(())
+    }
+
+    fn apply_directory_routes(&mut self, routes: &[directory::RouteAnnouncement]) {
+        for route in routes {
+            self.policy_routes.insert(
+                route.policy_id,
+                RouteOverride {
+                    segment: route.segment.clone(),
+                    interface: route.interface.clone(),
+                },
+            );
+        }
+    }
+
+    fn apply_static_policy_routes(&mut self) {
+        for route in &self.config.policy_routes {
+            self.policy_routes.insert(
+                route.policy_id,
+                RouteOverride {
+                    segment: route.segment.clone(),
+                    interface: route.interface.clone(),
+                },
+            );
+        }
     }
 
     pub fn handle_udp_packet(
@@ -207,11 +239,15 @@ impl HornetRuntime {
         }
 
         let (mut chdr, mut ahdr, mut body) = wire::decode(payload).map_err(ProcessError::Hornet)?;
+        let key = CircuitKey {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+        };
         match chdr.typ {
-            PacketType::Setup => {
-                self.process_setup(&chdr, &ahdr, &body, src_ip, src_port, dst_ip, dst_port)
-            }
-            PacketType::Data => self.process_data(&mut chdr, &mut ahdr, &mut body),
+            PacketType::Setup => self.process_setup(&chdr, &ahdr, &body, key),
+            PacketType::Data => self.process_data(&mut chdr, &mut ahdr, &mut body, key),
         }
     }
 
@@ -220,9 +256,14 @@ impl HornetRuntime {
         chdr: &mut Chdr,
         ahdr: &mut Ahdr,
         payload: &mut Vec<u8>,
+        key: CircuitKey,
     ) -> Result<ProcessOutcome, ProcessError> {
         let clock = StdClock;
-        let mut forwarder = RouterForward::new(self.listen_port);
+        let route_override = self
+            .circuits
+            .get(&key)
+            .and_then(|state| state.route_override.clone());
+        let mut forwarder = RouterForward::new(self.listen_port, route_override);
         let mut node_ctx = crate::hornet::node::NodeCtx {
             sv: self.sv,
             now: &clock,
@@ -243,10 +284,7 @@ impl HornetRuntime {
         chdr: &Chdr,
         ahdr: &Ahdr,
         payload: &[u8],
-        src_ip: Ipv4Addr,
-        src_port: u16,
-        dst_ip: Ipv4Addr,
-        dst_port: u16,
+        key: CircuitKey,
     ) -> Result<ProcessOutcome, ProcessError> {
         let clock = StdClock;
         let exp = types::Exp(clock.now_coarse());
@@ -280,14 +318,13 @@ impl HornetRuntime {
         )
         .map_err(ProcessError::Hornet)?;
 
-        let key = CircuitKey {
-            src_ip,
-            src_port,
-            dst_ip,
-            dst_port,
-        };
         let exp = crate::hornet::packet::chdr::chdr_exp(chdr).map(|exp| exp.0);
         let now = SystemTime::now();
+        let route_override = registered_ids
+            .iter()
+            .find_map(|id| self.policy_routes.get(id))
+            .cloned();
+
         self.circuits
             .entry(key)
             .and_modify(|state| {
@@ -299,19 +336,25 @@ impl HornetRuntime {
                     }
                 }
                 state.forward_keys.push(si);
+                state.route_override = route_override.clone();
             })
             .or_insert_with(|| CircuitState {
                 last_setup: now,
                 exp,
                 policies: registered_ids.clone(),
                 forward_keys: vec![si],
+                route_override: route_override.clone(),
             });
 
         let mut forward_payload = encode_setup_payload(&setup_pkt)?;
-        let mut forwarder = RouterForward::new(self.listen_port);
+        let chosen_segment = route_override
+            .as_ref()
+            .map(|r| r.segment.clone())
+            .unwrap_or_else(|| ahdr_res.r.clone());
+        let mut forwarder = RouterForward::new(self.listen_port, route_override);
         forwarder
             .send(
-                &ahdr_res.r,
+                &chosen_segment,
                 &setup_pkt.chdr,
                 &ahdr_res.ahdr_next,
                 &mut forward_payload,
@@ -368,6 +411,13 @@ struct CircuitState {
     exp: Option<u32>,
     policies: Vec<[u8; 32]>,
     forward_keys: Vec<types::Si>,
+    route_override: Option<RouteOverride>,
+}
+
+#[derive(Clone)]
+struct RouteOverride {
+    segment: RoutingSegment,
+    interface: Option<String>,
 }
 
 fn collect_metadata_tlvs(buf: &[u8]) -> Vec<Vec<u8>> {
@@ -451,6 +501,23 @@ pub fn decode_setup_payload(chdr: &Chdr, body: &[u8]) -> Result<setup::SetupPack
         rmax,
     };
 
+    let mut tlvs = Vec::new();
+    if idx + 2 <= body.len() {
+        let tlv_count = read_be_u16(&body[idx..idx + 2]) as usize;
+        idx += 2;
+        for _ in 0..tlv_count {
+            if idx + 2 > body.len() {
+                break;
+            }
+            let tlv_len = read_be_u16(&body[idx..idx + 2]) as usize;
+            idx += 2;
+            let avail = body.len().saturating_sub(idx);
+            let take = core::cmp::min(tlv_len, avail);
+            tlvs.push(body[idx..idx + take].to_vec());
+            idx += take;
+        }
+    }
+
     Ok(setup::SetupPacket {
         chdr: Chdr {
             typ: chdr.typ,
@@ -460,7 +527,7 @@ pub fn decode_setup_payload(chdr: &Chdr, body: &[u8]) -> Result<setup::SetupPack
         shdr: header,
         payload,
         rmax,
-        tlvs: Vec::new(),
+        tlvs,
     })
 }
 
@@ -480,7 +547,13 @@ pub fn encode_setup_payload(pkt: &setup::SetupPacket) -> Result<Vec<u8>, Process
         .map_err(|_| ProcessError::Malformed("payload too large"))?;
 
     let mut out = Vec::with_capacity(
-        ALPHA_LEN + GAMMA_LEN + 10 + pkt.shdr.beta.len() + pkt.payload.bytes.len(),
+        ALPHA_LEN
+            + GAMMA_LEN
+            + 10
+            + pkt.shdr.beta.len()
+            + pkt.payload.bytes.len()
+            + 2
+            + pkt.tlvs.iter().map(|tlv| 2 + tlv.len()).sum::<usize>(),
     );
     out.extend_from_slice(&pkt.shdr.alpha);
     out.extend_from_slice(&pkt.shdr.gamma);
@@ -491,6 +564,15 @@ pub fn encode_setup_payload(pkt: &setup::SetupPacket) -> Result<Vec<u8>, Process
     out.extend_from_slice(&pkt.shdr.beta);
     out.extend_from_slice(&payload_len_u16.to_be_bytes());
     out.extend_from_slice(&pkt.payload.bytes);
+    let tlv_count = u16::try_from(pkt.tlvs.len())
+        .map_err(|_| ProcessError::Malformed("too many TLVs in setup packet"))?;
+    out.extend_from_slice(&tlv_count.to_be_bytes());
+    for tlv in &pkt.tlvs {
+        let len =
+            u16::try_from(tlv.len()).map_err(|_| ProcessError::Malformed("setup TLV too large"))?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(tlv);
+    }
     Ok(out)
 }
 
@@ -500,13 +582,15 @@ fn read_be_u16(buf: &[u8]) -> u16 {
 
 struct RouterForward {
     source_port: u16,
+    override_route: Option<RouteOverride>,
     packet: Result<Option<ForwardPacket>, ProcessError>,
 }
 
 impl RouterForward {
-    fn new(source_port: u16) -> Self {
+    fn new(source_port: u16, override_route: Option<RouteOverride>) -> Self {
         Self {
             source_port,
+            override_route,
             packet: Ok(None),
         }
     }
@@ -532,7 +616,12 @@ impl Forward for RouterForward {
         {
             return Err(types::Error::NotImplemented);
         }
-        let elems = routing::elems_from_segment(rseg)?;
+        let selected_segment = self
+            .override_route
+            .as_ref()
+            .map(|route| route.segment.clone())
+            .unwrap_or_else(|| rseg.clone());
+        let elems = routing::elems_from_segment(&selected_segment)?;
         let next = elems
             .iter()
             .find_map(|elem| match elem {
@@ -550,6 +639,10 @@ impl Forward for RouterForward {
             next_port: next.1,
             source_port: self.source_port,
             wire_payload,
+            interface: self
+                .override_route
+                .as_ref()
+                .and_then(|route| route.interface.clone()),
         }));
         Ok(())
     }
@@ -589,10 +682,13 @@ fn hex_digit(c: char) -> Result<u8, InitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hornet::policy::{self, PolicyMetadata};
-    use crate::hornet::routing::{IpAddr, RouteElem};
-    use crate::hornet::types::{Exp, RoutingSegment, Sv};
+    use crate::config::HornetPolicyRoute;
+    use crate::hornet::policy::{PolicyCapsule, PolicyMetadata};
+    use crate::hornet::routing::{IpAddr as RoutingIpAddr, RouteElem};
+    use crate::hornet::types::{Ahdr, Exp, Nonce, RoutingSegment, Sv};
+    use hornet::source;
     use rand_core::{CryptoRng, RngCore};
+    use std::net::IpAddr as StdIpAddr;
     use tempfile::NamedTempFile;
 
     struct XorShift64(u64);
@@ -640,27 +736,25 @@ mod tests {
     fn make_config(temp_secret: &NamedTempFile, sv: [u8; 16], listen_port: u16) -> HornetConfig {
         HornetConfig {
             enabled: true,
-            listen_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            listen_addr: StdIpAddr::V4(Ipv4Addr::UNSPECIFIED),
             listen_port,
             node_secret_path: Some(temp_secret.path().to_path_buf()),
             sv_seed_hex: Some(to_hex(&sv)),
             directory_file: None,
             directory_secret_hex: None,
             policy_cache_ttl: 60,
+            policy_routes: Vec::new(),
         }
     }
 
     fn write_secret(file: &NamedTempFile, secret: &[u8]) {
-        use std::io::Write;
-        let mut writer = file.as_file_mut();
-        writer.write_all(secret).unwrap();
-        writer.flush().unwrap();
+        std::fs::write(file.path(), secret).expect("write secret");
     }
 
-    fn mk_route_segment() -> RoutingSegment {
+    fn mk_route_segment(ip: [u8; 4], port: u16) -> RoutingSegment {
         let elem = RouteElem::NextHop {
-            addr: IpAddr::V4([10, 0, 0, 1]),
-            port: 30000,
+            addr: RoutingIpAddr::V4(ip),
+            port,
         };
         routing::segment_from_elems(&[elem])
     }
@@ -686,12 +780,22 @@ mod tests {
             verifier_blob: vec![0xAA, 0xBB],
         };
         state.attach_policy_metadata(&meta);
+        dbg!(state.packet.tlvs.iter().map(|tlv| tlv.len()).collect::<Vec<_>>());
+        dbg!(state.packet.shdr.beta.len());
+        dbg!(state.packet.payload.bytes.len());
+        assert_eq!(state.packet.tlvs.len(), 1);
 
         let encoded = encode_setup_payload(&state.packet).expect("encode");
+        dbg!(encoded.len());
+        println!(
+            "tail bytes: {:?}",
+            &encoded[encoded.len().saturating_sub(64)..]
+        );
         let decoded = decode_setup_payload(&state.packet.chdr, &encoded).expect("decode");
         assert_eq!(decoded.shdr.rmax, state.packet.shdr.rmax);
         assert_eq!(decoded.shdr.stage, state.packet.shdr.stage);
         assert_eq!(decoded.payload.bytes, state.packet.payload.bytes);
+        assert_eq!(decoded.tlvs, state.packet.tlvs);
     }
 
     #[test]
@@ -716,14 +820,10 @@ mod tests {
         };
         state.attach_policy_metadata(&meta);
 
-        let mut route_seg = mk_route_segment();
-        let fs = crate::hornet::packet::core::create(
-            &Sv(node.2 .0),
-            &state.keys_f[0],
-            &route_seg,
-            &state.packet.chdr,
-        )
-        .expect("fs");
+        let route_seg = mk_route_segment([10, 0, 0, 1], 30000);
+        let fs =
+            crate::hornet::packet::core::create(&Sv(node.2 .0), &state.keys_f[0], &route_seg, exp)
+                .expect("fs");
         let mut rng2 = XorShift64(0x5555_6666_7777_8888);
         let ahdr = crate::hornet::packet::ahdr::create_ahdr(
             &state.keys_f,
@@ -738,7 +838,12 @@ mod tests {
 
         let temp_secret = NamedTempFile::new().expect("temp");
         write_secret(&temp_secret, &node.0);
-        let cfg = make_config(&temp_secret, node.2 .0, 40000);
+        let mut cfg = make_config(&temp_secret, node.2 .0, 40000);
+        cfg.policy_routes.push(HornetPolicyRoute {
+            policy_id: meta.policy_id,
+            segment: route_seg.clone(),
+            interface: Some("wan0".to_string()),
+        });
         let mut runtime = HornetRuntime::new(&cfg).expect("runtime");
 
         let outcome = runtime
@@ -755,9 +860,173 @@ mod tests {
                 assert_eq!(pkt.next_addr, Ipv4Addr::new(10, 0, 0, 1));
                 assert_eq!(pkt.next_port, 30000);
                 assert!(!pkt.wire_payload.is_empty());
+                assert_eq!(pkt.interface.as_deref(), Some("wan0"));
             }
-            other => panic!("unexpected outcome: {:?}", other),
+            ProcessOutcome::Consumed => {
+                panic!("expected forward outcome for setup hop")
+            }
+            ProcessOutcome::NotHandled => {
+                panic!("setup hop was not handled")
+            }
         }
+    }
+
+    #[test]
+    fn end_to_end_setup_and_data_multi_hop() {
+        let mut rng = XorShift64(0x5151_a1a1_b2b2_c3c3);
+        let nodes = vec![gen_node(&mut rng, 0x1000), gen_node(&mut rng, 0x2000)];
+        let pubs: Vec<[u8; 32]> = nodes.iter().map(|n| n.1).collect();
+        let exp = Exp(4_200_000);
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        seed[0] &= 248;
+        seed[31] &= 127;
+        seed[31] |= 64;
+
+        let rmax = pubs.len();
+        let mut state = setup::source_init(&seed, &pubs, rmax, exp, &mut rng);
+        let meta = PolicyMetadata {
+            policy_id: [0x33; 32],
+            version: 1,
+            expiry: exp.0,
+            flags: 0,
+            verifier_blob: Vec::new(),
+        };
+        state.attach_policy_metadata(&meta);
+
+        let route_seg1 = mk_route_segment([10, 0, 0, 2], 45000);
+        let route_seg2 = mk_route_segment([203, 0, 113, 9], 55000);
+
+        let fs1 =
+            crate::hornet::packet::core::create(&nodes[0].2, &state.keys_f[0], &route_seg1, exp)
+                .expect("fs1");
+        let fs2 =
+            crate::hornet::packet::core::create(&nodes[1].2, &state.keys_f[1], &route_seg2, exp)
+                .expect("fs2");
+        let mut rng_hdr = XorShift64(0x3333_4444_5555_6666);
+        let ahdr_setup = crate::hornet::packet::ahdr::create_ahdr(
+            &state.keys_f,
+            &[fs1.clone(), fs2.clone()],
+            state.packet.rmax,
+            &mut rng_hdr,
+        )
+        .expect("ahdr setup");
+
+        let setup_payload = encode_setup_payload(&state.packet).expect("encode setup");
+        let wire_setup = wire::encode(&state.packet.chdr, &ahdr_setup, &setup_payload);
+
+        let temp_secret1 = NamedTempFile::new().expect("temp1");
+        let temp_secret2 = NamedTempFile::new().expect("temp2");
+        write_secret(&temp_secret1, &nodes[0].0);
+        write_secret(&temp_secret2, &nodes[1].0);
+
+        let mut cfg1 = make_config(&temp_secret1, nodes[0].2 .0, 40000);
+        cfg1.policy_routes.push(HornetPolicyRoute {
+            policy_id: meta.policy_id,
+            segment: route_seg1.clone(),
+            interface: Some("wan0".to_string()),
+        });
+        let mut cfg2 = make_config(&temp_secret2, nodes[1].2 .0, 45000);
+        cfg2.policy_routes.push(HornetPolicyRoute {
+            policy_id: meta.policy_id,
+            segment: route_seg2.clone(),
+            interface: None,
+        });
+
+        let mut runtime1 = HornetRuntime::new(&cfg1).expect("runtime1");
+        let mut runtime2 = HornetRuntime::new(&cfg2).expect("runtime2");
+
+        let forwarded_setup = runtime1
+            .handle_udp_packet(
+                Ipv4Addr::new(192, 0, 2, 1),
+                41000,
+                Ipv4Addr::LOCALHOST,
+                40000,
+                &wire_setup,
+            )
+            .expect("setup hop1");
+        let wire_to_second = match forwarded_setup {
+            ProcessOutcome::Forward(pkt) => {
+                assert_eq!(pkt.next_addr, Ipv4Addr::new(10, 0, 0, 2));
+                assert_eq!(pkt.next_port, 45000);
+                assert_eq!(pkt.interface.as_deref(), Some("wan0"));
+                pkt.wire_payload
+            }
+            ProcessOutcome::Consumed => panic!("expected forward outcome on hop1"),
+            ProcessOutcome::NotHandled => panic!("setup hop1 not handled"),
+        };
+        let outcome_second = runtime2
+            .handle_udp_packet(
+                Ipv4Addr::new(10, 0, 0, 2),
+                45000,
+                Ipv4Addr::LOCALHOST,
+                45000,
+                &wire_to_second,
+            )
+            .expect("setup hop2");
+        assert!(matches!(outcome_second, ProcessOutcome::Consumed));
+
+        let mut nonce = Nonce([0u8; 16]);
+        rng.fill_bytes(&mut nonce.0);
+        let mut chdr_data = crate::hornet::packet::chdr::data_header(rmax as u8, nonce);
+        let mut rng_data = XorShift64(0x7777_8888_9999_aaaa);
+        let ahdr_data = crate::hornet::packet::ahdr::create_ahdr(
+            &state.keys_f,
+            &[fs1, fs2],
+            state.packet.rmax,
+            &mut rng_data,
+        )
+        .expect("ahdr data");
+
+        let capsule = PolicyCapsule {
+            policy_id: meta.policy_id,
+            version: 1,
+            proof: Vec::new(),
+            commitment: Vec::new(),
+            aux: Vec::new(),
+        };
+        let mut data_payload = capsule.encode();
+        data_payload.extend_from_slice(b"payload");
+        let mut iv0 = Nonce([0u8; 16]);
+        rng.fill_bytes(&mut iv0.0);
+        source::build(
+            &mut chdr_data,
+            &Ahdr { bytes: Vec::new() },
+            &state.keys_f,
+            &mut iv0,
+            &mut data_payload,
+        )
+        .expect("encrypt data");
+        let wire_data = wire::encode(&chdr_data, &ahdr_data, &data_payload);
+
+        let forwarded_data = runtime1
+            .handle_udp_packet(
+                Ipv4Addr::new(192, 0, 2, 1),
+                41000,
+                Ipv4Addr::LOCALHOST,
+                40000,
+                &wire_data,
+            )
+            .expect("data hop1");
+        let payload_second = match forwarded_data {
+            ProcessOutcome::Forward(pkt) => {
+                assert_eq!(pkt.next_addr, Ipv4Addr::new(10, 0, 0, 2));
+                assert_eq!(pkt.next_port, 45000);
+                pkt.wire_payload
+            }
+            ProcessOutcome::Consumed => panic!("expected forward outcome on data hop1"),
+            ProcessOutcome::NotHandled => panic!("data hop1 not handled"),
+        };
+        let outcome_final = runtime2
+            .handle_udp_packet(
+                Ipv4Addr::new(10, 0, 0, 2),
+                45000,
+                Ipv4Addr::LOCALHOST,
+                45000,
+                &payload_second,
+            )
+            .expect("data hop2");
+        assert!(matches!(outcome_final, ProcessOutcome::Consumed));
     }
 
     fn gen_node(rng: &mut XorShift64, seed: u64) -> ([u8; 32], [u8; 32], Sv) {

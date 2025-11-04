@@ -404,6 +404,13 @@ fn ipv4_to_u32(addr: Ipv4Addr) -> u32 {
     u32::from_be_bytes(addr.octets())
 }
 
+fn find_device_by_name(name: &str) -> Option<NetDevice> {
+    net_device_list()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.iter().find(|d| d.name == name).cloned())
+}
+
 pub fn print_ip_addr(ip: u32) -> String {
     let b = ip.to_be_bytes();
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
@@ -682,6 +689,11 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
                         Ok(ProcessOutcome::Forward(packet)) => {
                             let src_addr = ipheader.dest_addr;
                             let dest_addr = ipv4_to_u32(packet.next_addr);
+                            let override_dev = packet
+                                .interface
+                                .as_ref()
+                                .and_then(|name| find_device_by_name(name));
+                            let output_dev = override_dev.as_ref().unwrap_or(inputdev);
                             let udp_segment = build_udp_segment(
                                 src_addr,
                                 dest_addr,
@@ -690,7 +702,7 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
                                 &packet.wire_payload,
                             );
                             ip_packet_encapsulate_output(
-                                inputdev,
+                                output_dev,
                                 dest_addr,
                                 src_addr,
                                 &udp_segment,

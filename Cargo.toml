@@ -7,7 +7,14 @@ edition = "2021"
 clap = { version = "4.5.47", features = ["derive"] }
 serde = { version = "1.0.215", features = ["derive"] }
 serde_yaml = "0.9.34"
+serde_json = "1.0"
 libc = "0.2.161"
 hornet = { git = "https://github.com/Project-SAN/HORNET", default-features = false }
-rand_core = "0.9.3"
-tempfile = "3.23.0"
+
+[patch."https://github.com/Project-SAN/HORNET"]
+hornet = { path = "../hornet" }
+
+[dev-dependencies]
+rand_core = "0.6"
+tempfile = "3"
+x25519-dalek = { version = "2", default-features = false }
