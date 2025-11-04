@@ -1,4 +1,5 @@
 use crate::arp;
+use crate::hornet_runtime::{self, ProcessOutcome};
 use crate::icmp;
 use crate::nat;
 use std::net::Ipv4Addr;
@@ -336,6 +337,73 @@ fn calc_checksum(buf: &[u8]) -> [u8; 2] {
     (!sum as u16).to_be_bytes()
 }
 
+struct ParsedUdp<'a> {
+    src_port: u16,
+    dest_port: u16,
+    payload: &'a [u8],
+}
+
+fn parse_udp_packet(packet: &[u8]) -> Option<ParsedUdp<'_>> {
+    if packet.len() < 8 {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([packet[0], packet[1]]);
+    let dest_port = u16::from_be_bytes([packet[2], packet[3]]);
+    let length = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    if length < 8 || length > packet.len() {
+        return None;
+    }
+    let payload_len = length - 8;
+    if payload_len > packet.len() - 8 {
+        return None;
+    }
+    let payload = &packet[8..8 + payload_len];
+    Some(ParsedUdp {
+        src_port,
+        dest_port,
+        payload,
+    })
+}
+
+fn build_udp_segment(
+    src_ip: u32,
+    dest_ip: u32,
+    src_port: u16,
+    dest_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let length = (8 + payload.len()) as u16;
+    let mut segment = Vec::with_capacity(length as usize);
+    segment.extend_from_slice(&src_port.to_be_bytes());
+    segment.extend_from_slice(&dest_port.to_be_bytes());
+    segment.extend_from_slice(&length.to_be_bytes());
+    segment.extend_from_slice(&0u16.to_be_bytes()); // checksum placeholder
+    segment.extend_from_slice(payload);
+
+    let checksum = udp_checksum(src_ip, dest_ip, IP_PROTOCOL_NUM_UDP, &segment);
+    segment[6] = (checksum >> 8) as u8;
+    segment[7] = (checksum & 0xFF) as u8;
+    segment
+}
+
+fn udp_checksum(src_ip: u32, dest_ip: u32, protocol: u8, segment: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(12 + segment.len());
+    pseudo.extend_from_slice(&src_ip.to_be_bytes());
+    pseudo.extend_from_slice(&dest_ip.to_be_bytes());
+    pseudo.push(0);
+    pseudo.push(protocol);
+    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+    pseudo.extend_from_slice(segment);
+    if pseudo.len() % 2 != 0 {
+        pseudo.push(0);
+    }
+    u16::from_be_bytes(calc_checksum(&pseudo))
+}
+
+fn ipv4_to_u32(addr: Ipv4Addr) -> u32 {
+    u32::from_be_bytes(addr.octets())
+}
+
 pub fn print_ip_addr(ip: u32) -> String {
     let b = ip.to_be_bytes();
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
@@ -602,6 +670,45 @@ fn ip_input_to_ours(inputdev: &NetDevice, ipheader: &IpHeader, payload: &[u8]) {
             icmp_input(inputdev, ipheader.src_addr, ipheader.dest_addr, payload);
         }
         IP_PROTOCOL_NUM_UDP => {
+            if let Some(udp) = parse_udp_packet(payload) {
+                if let Some(processed) = hornet_runtime::handle_udp_packet(
+                    Ipv4Addr::from(ipheader.src_addr),
+                    udp.src_port,
+                    Ipv4Addr::from(ipheader.dest_addr),
+                    udp.dest_port,
+                    udp.payload,
+                ) {
+                    match processed {
+                        Ok(ProcessOutcome::Forward(packet)) => {
+                            let src_addr = ipheader.dest_addr;
+                            let dest_addr = ipv4_to_u32(packet.next_addr);
+                            let udp_segment = build_udp_segment(
+                                src_addr,
+                                dest_addr,
+                                packet.source_port,
+                                packet.next_port,
+                                &packet.wire_payload,
+                            );
+                            ip_packet_encapsulate_output(
+                                inputdev,
+                                dest_addr,
+                                src_addr,
+                                &udp_segment,
+                                IP_PROTOCOL_NUM_UDP,
+                            );
+                            return;
+                        }
+                        Ok(ProcessOutcome::Consumed) => {
+                            return;
+                        }
+                        Ok(ProcessOutcome::NotHandled) => { /* continue */ }
+                        Err(err) => {
+                            eprintln!("HORNET processing error: {}", err);
+                            return;
+                        }
+                    }
+                }
+            }
             println!("udp received : {:x?}", payload);
         }
         IP_PROTOCOL_NUM_TCP => {

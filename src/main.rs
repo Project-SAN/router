@@ -45,6 +45,13 @@ fn main() {
         router_config.routes.len()
     );
 
+    if let Some(hornet_cfg) = router_config.hornet.as_ref() {
+        if let Err(err) = router::hornet_runtime::init(hornet_cfg) {
+            eprintln!("failed to initialise HORNET runtime: {err}");
+            std::process::exit(1);
+        }
+    }
+
     if let Err(err) = runtime::initialize_network_state(router_config) {
         eprintln!("failed to initialize network state: {err}");
         std::process::exit(1);

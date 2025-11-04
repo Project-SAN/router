@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -11,6 +11,7 @@ pub struct RouterConfig {
     pub config_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
     pub routes: Vec<RouteConfig>,
+    pub hornet: Option<HornetConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +43,18 @@ pub struct RouteConfig {
     pub next_hop: Option<Ipv4Addr>,
     pub interface: Option<String>,
     pub metric: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HornetConfig {
+    pub enabled: bool,
+    pub listen_addr: IpAddr,
+    pub listen_port: u16,
+    pub node_secret_path: Option<PathBuf>,
+    pub sv_seed_hex: Option<String>,
+    pub directory_file: Option<PathBuf>,
+    pub directory_secret_hex: Option<String>,
+    pub policy_cache_ttl: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -147,12 +160,15 @@ impl RouterConfig {
             routes.push(RouteConfig::from_raw(route)?);
         }
 
+        let hornet = raw.hornet.map(HornetConfig::from_raw).transpose()?;
+
         Ok(Self {
             mode,
             debug_level,
             config_path: path.to_path_buf(),
             devices,
             routes,
+            hornet,
         })
     }
 }
@@ -215,6 +231,49 @@ impl RouteConfig {
     }
 }
 
+impl HornetConfig {
+    fn from_raw(raw: RawHornetConfig) -> Result<Self, ConfigError> {
+        let listen_addr = parse_ip_addr_any(raw.listen_addr.as_deref().unwrap_or("0.0.0.0"))?;
+
+        let listen_port = raw.listen_port.unwrap_or(30_000);
+        if listen_port == 0 {
+            return Err(ConfigError::InvalidValue(
+                "hornet.listen_port must be greater than 0".into(),
+            ));
+        }
+
+        let node_secret_path = raw.node_secret_path.map(PathBuf::from);
+        let sv_seed_hex = raw
+            .sv_seed
+            .map(|seed| normalize_hex_with_len(&seed, 16))
+            .transpose()?;
+
+        let directory_file = raw.directory_file.map(PathBuf::from);
+        let directory_secret_hex = raw
+            .directory_secret
+            .map(|secret| normalize_hex(&secret))
+            .transpose()?;
+
+        let policy_cache_ttl = raw.policy_cache_ttl.unwrap_or(300);
+        if policy_cache_ttl == 0 {
+            return Err(ConfigError::InvalidValue(
+                "hornet.policy_cache_ttl must be greater than 0".into(),
+            ));
+        }
+
+        Ok(HornetConfig {
+            enabled: raw.enabled,
+            listen_addr,
+            listen_port,
+            node_secret_path,
+            sv_seed_hex,
+            directory_file,
+            directory_secret_hex,
+            policy_cache_ttl,
+        })
+    }
+}
+
 impl From<RawNatRole> for NatRole {
     fn from(value: RawNatRole) -> Self {
         match value {
@@ -270,6 +329,47 @@ fn parse_mac_address(input: &str) -> Result<[u8; 6], ConfigError> {
     Ok(mac)
 }
 
+fn parse_ip_addr_any(input: &str) -> Result<IpAddr, ConfigError> {
+    input
+        .parse::<IpAddr>()
+        .map_err(|e| ConfigError::InvalidValue(format!("invalid IP address `{}`: {}", input, e)))
+}
+
+fn normalize_hex(input: &str) -> Result<String, ConfigError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidValue(
+            "hex string must not be empty".into(),
+        ));
+    }
+    if trimmed.len() % 2 != 0 {
+        return Err(ConfigError::InvalidValue(format!(
+            "hex string `{}` must have even length",
+            trimmed
+        )));
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ConfigError::InvalidValue(format!(
+            "hex string `{}` contains non-hex characters",
+            trimmed
+        )));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+fn normalize_hex_with_len(input: &str, expected_bytes: usize) -> Result<String, ConfigError> {
+    let normalized = normalize_hex(input)?;
+    if normalized.len() != expected_bytes * 2 {
+        return Err(ConfigError::InvalidValue(format!(
+            "hex string `{}` must encode {} bytes ({} hex chars)",
+            normalized,
+            expected_bytes,
+            expected_bytes * 2
+        )));
+    }
+    Ok(normalized)
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct RawRouterConfig {
     #[serde(default)]
@@ -280,6 +380,8 @@ struct RawRouterConfig {
     devices: Vec<RawDeviceConfig>,
     #[serde(default)]
     routes: Vec<RawRouteConfig>,
+    #[serde(default)]
+    hornet: Option<RawHornetConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +424,26 @@ struct RawRouteConfig {
     interface: Option<String>,
     #[serde(default)]
     metric: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawHornetConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    listen_addr: Option<String>,
+    #[serde(default)]
+    listen_port: Option<u16>,
+    #[serde(default)]
+    node_secret_path: Option<String>,
+    #[serde(default)]
+    sv_seed: Option<String>,
+    #[serde(default)]
+    directory_file: Option<String>,
+    #[serde(default)]
+    directory_secret: Option<String>,
+    #[serde(default)]
+    policy_cache_ttl: Option<u64>,
 }
 
 fn default_true() -> bool {

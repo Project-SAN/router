@@ -2,6 +2,8 @@ pub mod arp;
 pub mod config;
 pub mod control;
 pub mod ethernet;
+pub mod hornet;
+pub mod hornet_runtime;
 pub mod icmp;
 pub mod ip;
 pub mod nat;
